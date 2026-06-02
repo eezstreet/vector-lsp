@@ -46,7 +46,12 @@ function hover(ctx: HoverContext): HoverResult | null {
     parts.push("");
 
     if (paramsIdx >= 0 && matched[paramsIdx]) {
-        parts.push("**Parameters:** " + matched[paramsIdx]);
+        const paramList = matched[paramsIdx]
+            .split(/[\r\n]+/)
+            .map((s: string) => s.trim())
+            .filter((s: string) => s.length > 0)
+            .join(", ");
+        parts.push("**Parameters:** " + paramList);
     }
 
     if (descIdx >= 0 && matched[descIdx]) {
