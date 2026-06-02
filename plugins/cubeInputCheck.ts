@@ -192,8 +192,9 @@ function hover(ctx: HoverContext): HoverResult | null {
         parts.push("**any** — Accepts any item");
     } else {
         const itemNames = getFilteredColumnValues("weapons", "name", "code", base)
-            .concat(getFilteredColumnValues("armor",   "name", "code", base))
-            .concat(getFilteredColumnValues("misc",    "name", "code", base));
+            .concat(getFilteredColumnValues("armor",     "name", "code", base))
+            .concat(getFilteredColumnValues("misc",      "name", "code", base))
+            .concat(getFilteredColumnValues("itemtypes", "name", "code", base));
 
         if (itemNames.length > 0) {
             parts.push("**" + base + "** — " + itemNames[0]);
@@ -201,8 +202,6 @@ function hover(ctx: HoverContext): HoverResult | null {
             parts.push("**" + base + "** (Unique Item)");
         } else if (lookupKey("setitems", "index", base)) {
             parts.push("**" + base + "** (Set Item)");
-        } else if (lookupKey("itemtypes", "Code", base)) {
-            parts.push("**" + base + "** (Item Type)");
         } else {
             return null;
         }
