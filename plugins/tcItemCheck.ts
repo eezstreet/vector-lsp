@@ -203,7 +203,8 @@ function hover(ctx: HoverContext): HoverResult | null {
 
     const names = getFilteredColumnValues("weapons", "name", "code", ctx.value).concat(
         getFilteredColumnValues("armor", "name", "code", ctx.value),
-        getFilteredColumnValues("misc", "name", "code", ctx.value)
+        getFilteredColumnValues("misc", "name", "code", ctx.value),
+        getFilteredColumnValues("itemtypes", "name", "code", ctx.value.substring(0, ctx.value.length - 1))
     );
     const name = names[0];
     if (!name) return null;
