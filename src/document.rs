@@ -63,6 +63,22 @@ impl DocumentData {
         self.rows.get(row_index)?.cells.get(col_index)
     }
 
+    /// Return the column index whose header starts at or before `character` in line 0,
+    /// using the same "last winner" rule as `cell_at`. Returns None if headers is empty.
+    pub fn header_at(&self, character: u32) -> Option<usize> {
+        let mut col_start = 0u32;
+        let mut found = None;
+        for (i, header) in self.headers.iter().enumerate() {
+            if col_start <= character {
+                found = Some(i);
+            } else {
+                break;
+            }
+            col_start += header.chars().count() as u32 + 1;
+        }
+        found
+    }
+
     /// Return the (column_index, &Cell) for the given cursor position, or None if
     /// the position is not within any data row (e.g. cursor is on the header line).
     ///

@@ -72,8 +72,8 @@ pub struct VectorLspSettings {
     #[serde(default = "default_extension")]
     pub extension: String,
     pub schema_path: Option<PathBuf>,
-    #[serde(default)]
-    pub plugins: Vec<PathBuf>,
+    /// Directory to scan for plugin files (*.ts / *.js).
+    pub plugin_path: Option<PathBuf>,
 }
 
 impl VectorLspSettings {
@@ -90,7 +90,7 @@ impl Default for VectorLspSettings {
             encoding: Encoding::Utf8,
             extension: default_extension(),
             schema_path: None,
-            plugins: Vec::new(),
+            plugin_path: None,
         }
     }
 }

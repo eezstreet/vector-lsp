@@ -1,22 +1,343 @@
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::Result;
-use deno_core::{FastString, JsRuntime, RuntimeOptions};
+use anyhow::{Context as _, Result};
+use deno_core::{extension, op2, FastString, JsRuntime, OpState, RuntimeOptions};
+use serde_json::Value;
+use tower_lsp::lsp_types::Url;
+
+use crate::document::DocumentData;
+use crate::schema::{format_description, Schema};
+
+// ---------------------------------------------------------------------------
+// WorkspaceFileSnapshot — per-file DocumentData references for plugin ops
+// ---------------------------------------------------------------------------
+
+/// Holds references to parsed documents so plugin ops can access them without
+/// pre-serialising the whole workspace.  Only the columns a plugin actually
+/// requests are serialised, when the op is called.
+pub struct WorkspaceFileSnapshot {
+    /// Lowercase stem → parsed document.
+    pub files: HashMap<String, Arc<DocumentData>>,
+}
+
+impl WorkspaceFileSnapshot {
+    pub fn new() -> Self {
+        Self { files: HashMap::new() }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkspaceIndex — O(1) lookup table for plugin ops
+// ---------------------------------------------------------------------------
+
+/// Pre-built lookup table keyed by `(file_stem_lowercase, column_name)`.
+/// Stored in the JS runtime's `OpState` so plugin ops can reach it.
+pub struct WorkspaceIndex {
+    /// Value existence index: `(file_stem_lowercase, col_name)` → set of values.
+    data: HashMap<(String, String), HashSet<String>>,
+    /// Ordered header list per file (open-doc entries shadow cache entries).
+    columns: HashMap<String, Vec<String>>,
+}
+
+impl WorkspaceIndex {
+    pub fn new() -> Self {
+        Self { data: HashMap::new(), columns: HashMap::new() }
+    }
+
+    fn insert(&mut self, file: &str, col: &str, value: String) {
+        self.data
+            .entry((file.to_lowercase(), col.to_lowercase()))
+            .or_default()
+            .insert(value.to_lowercase());
+    }
+
+    pub fn lookup(&self, file: &str, col: &str, value: &str) -> bool {
+        self.data
+            .get(&(file.to_lowercase(), col.to_lowercase()))
+            .map(|s| s.contains(&value.to_lowercase()))
+            .unwrap_or(false)
+    }
+
+    /// Return the 0-based header position of `col` in `file`, or `None`.
+    /// The comparison is case-insensitive.
+    pub fn column_index(&self, file: &str, col: &str) -> Option<usize> {
+        let col_lower = col.to_lowercase();
+        self.columns
+            .get(&file.to_lowercase())?
+            .iter()
+            .position(|h| h.to_lowercase() == col_lower)
+    }
+}
+
+/// Build a `WorkspaceIndex` from open documents and the file cache.
+/// Open documents shadow file-cache entries for the same stem.
+/// Returns an `Arc` so the index can be shared cheaply across multiple plugin calls.
+pub fn build_workspace_index(
+    open_docs: &HashMap<Url, Arc<DocumentData>>,
+    file_cache: &HashMap<PathBuf, Arc<DocumentData>>,
+) -> Arc<WorkspaceIndex> {
+    let mut idx = WorkspaceIndex::new();
+
+    for (path, doc) in file_cache {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            index_doc(&mut idx, stem, doc);
+        }
+    }
+    // Open docs are processed second so they overwrite cache column lists.
+    for (uri, doc) in open_docs {
+        let stem = uri
+            .path_segments()
+            .and_then(|s| s.last())
+            .and_then(|n| n.rfind('.').map(|i| &n[..i]))
+            .unwrap_or_default();
+        if !stem.is_empty() {
+            index_doc(&mut idx, stem, doc);
+        }
+    }
+
+    Arc::new(idx)
+}
+
+fn index_doc(idx: &mut WorkspaceIndex, stem: &str, doc: &DocumentData) {
+    // Record ordered header list (last write wins, so open docs beat cache).
+    idx.columns.insert(stem.to_lowercase(), doc.headers.clone());
+
+    for row in &doc.rows {
+        for (col_i, cell) in row.cells.iter().enumerate() {
+            if cell.value.is_empty() {
+                continue;
+            }
+            if let Some(h) = doc.headers.get(col_i) {
+                if !h.is_empty() {
+                    idx.insert(stem, h, cell.value.clone());
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deno op
+// ---------------------------------------------------------------------------
+
+/// Look up whether `value` exists in column `col` of file `file`.
+/// Callable from JS as `Deno.core.ops.op_lookup_key(file, col, value)`.
+#[op2(nofast)]
+pub fn op_lookup_key(
+    state: &OpState,
+    #[string] file: &str,
+    #[string] col: &str,
+    #[string] value: &str,
+) -> bool {
+    state
+        .try_borrow::<Arc<WorkspaceIndex>>()
+        .map(|idx| idx.lookup(file, col, value))
+        .unwrap_or(false)
+}
+
+#[derive(serde::Serialize)]
+struct ColumnInfo {
+    /// 0-based position of this column in the file's header row.
+    index: usize,
+}
+
+#[op2]
+#[serde]
+pub fn op_get_column(
+    state: &OpState,
+    #[string] file: &str,
+    #[string] col: &str,
+) -> Option<ColumnInfo> {
+    state
+        .try_borrow::<Arc<WorkspaceIndex>>()
+        .and_then(|idx| idx.column_index(file, col).map(|index| ColumnInfo { index }))
+}
+
+/// Return `true` if `stem` is present in the workspace snapshot.
+/// Callable from JS as `Deno.core.ops.op_has_file(stem)`.
+#[op2(fast)]
+pub fn op_has_file(state: &OpState, #[string] stem: &str) -> bool {
+    state
+        .try_borrow::<Arc<WorkspaceFileSnapshot>>()
+        .map(|snap| snap.files.contains_key(&stem.to_lowercase()))
+        .unwrap_or(false)
+}
+
+/// Return all non-empty values in column `col` of file `stem`.
+/// Callable from JS as `Deno.core.ops.op_get_column_values(stem, col)`.
+#[op2]
+#[serde]
+pub fn op_get_column_values(
+    state: &OpState,
+    #[string] stem: &str,
+    #[string] col: &str,
+) -> Vec<String> {
+    let Some(snap) = state.try_borrow::<Arc<WorkspaceFileSnapshot>>() else { return vec![] };
+    let Some(doc) = snap.files.get(&stem.to_lowercase()) else { return vec![] };
+    let col_lower = col.to_lowercase();
+    let Some(col_idx) = doc.headers.iter().position(|h| h.to_lowercase() == col_lower) else {
+        return vec![];
+    };
+    doc.rows.iter()
+        .filter_map(|row| row.cells.get(col_idx))
+        .filter(|cell| !cell.value.is_empty())
+        .map(|cell| cell.value.clone())
+        .collect()
+}
+
+/// Return non-empty values from `value_col` in file `stem` where `filter_col == filter_value`.
+/// Callable from JS as `Deno.core.ops.op_get_filtered_column_values(stem, valueCol, filterCol, filterValue)`.
+#[op2]
+#[serde]
+pub fn op_get_filtered_column_values(
+    state: &OpState,
+    #[string] stem: &str,
+    #[string] value_col: &str,
+    #[string] filter_col: &str,
+    #[string] filter_value: &str,
+) -> Vec<String> {
+    let Some(snap) = state.try_borrow::<Arc<WorkspaceFileSnapshot>>() else { return vec![] };
+    let Some(doc) = snap.files.get(&stem.to_lowercase()) else { return vec![] };
+    let Some(vi) = doc.headers.iter().position(|h| h.eq_ignore_ascii_case(value_col)) else {
+        return vec![];
+    };
+    let Some(fi) = doc.headers.iter().position(|h| h.eq_ignore_ascii_case(filter_col)) else {
+        return vec![];
+    };
+    doc.rows.iter()
+        .filter(|row| row.cells.get(fi).map(|c| c.value == filter_value).unwrap_or(false))
+        .filter_map(|row| row.cells.get(vi))
+        .filter(|cell| !cell.value.is_empty())
+        .map(|cell| cell.value.clone())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Enum table op
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct EnumTableResult {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+/// Return the enum table for a field, or `null` if none exists.
+/// Cells are normalised: object values use their `text` property; descriptions
+/// have `$!...!$` cross-refs resolved and HTML simplified to Markdown.
+/// Callable from JS as `Deno.core.ops.op_get_enum_table(file, col)`.
+#[op2]
+#[serde]
+pub fn op_get_enum_table(
+    state: &OpState,
+    #[string] file: &str,
+    #[string] col: &str,
+) -> Option<EnumTableResult> {
+    let schema = state.try_borrow::<Arc<Schema>>()?;
+    let field = schema.find_field(file, col)?;
+    let table = field.table.as_ref()?;
+    let header_row = table.first()?;
+    let headers = header_row.iter().map(cell_raw).collect();
+    let rows = table.iter().skip(1).map(|row| row.iter().map(cell_formatted).collect()).collect();
+    Some(EnumTableResult { headers, rows })
+}
+
+/// Extract the string value from a table cell (string literal or `{text: "..."}` object).
+fn cell_raw(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Object(o) => o.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Like `cell_raw` but additionally formats `$!...!$` cross-refs and strips HTML
+/// tags (converting `<li>` to a bullet prefix).
+fn cell_formatted(v: &Value) -> String {
+    let raw = cell_raw(v);
+    let formatted = format_description(&raw);
+    html_to_markdown(&formatted)
+}
+
+/// Convert a string that may contain basic HTML into Markdown.
+/// - `<li>` → `\n- `
+/// - `</li>`, `<ol>`, `</ol>`, `<ul>`, `</ul>` → stripped
+/// - All other tags stripped as well.
+fn html_to_markdown(s: &str) -> String {
+    let s = s
+        .replace("<li>", "\n- ")
+        .replace("</li>", "")
+        .replace("<ol>", "")
+        .replace("</ol>", "")
+        .replace("<ul>", "")
+        .replace("</ul>", "");
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+extension!(
+    vlsp_ops,
+    ops = [
+        op_lookup_key,
+        op_get_column,
+        op_has_file,
+        op_get_column_values,
+        op_get_filtered_column_values,
+        op_get_enum_table,
+    ],
+);
+
+// ---------------------------------------------------------------------------
+// ScriptRuntime
+// ---------------------------------------------------------------------------
 
 /// A lightweight wrapper around a Deno/V8 JavaScript runtime.
 ///
-/// Used for schema loading (evaluating the JS schema folder) and will serve as
-/// the host for JS plugins. Keeping this abstraction isolated means the rest of
-/// the codebase never touches deno_core directly; only this module needs to
-/// change if the deno_core API evolves.
+/// Used for schema loading (evaluating the JS schema folder) and serves as
+/// the host for JS plugins. Keeping this abstraction isolated means the rest
+/// of the codebase never touches deno_core directly.
 pub struct ScriptRuntime {
     inner: JsRuntime,
 }
 
 impl ScriptRuntime {
     pub fn new() -> Result<Self> {
-        let inner = JsRuntime::new(RuntimeOptions::default());
+        let inner = JsRuntime::new(RuntimeOptions {
+            extensions: vec![vlsp_ops::init_ops_and_esm()],
+            ..Default::default()
+        });
         Ok(Self { inner })
+    }
+
+    /// Replace the schema stored in `OpState`.
+    /// Call this once after schema loading so `op_get_enum_table` has data.
+    pub fn set_schema(&mut self, schema: Arc<Schema>) {
+        self.inner.op_state().borrow_mut().put(schema);
+    }
+
+    /// Replace the workspace index stored in `OpState`.
+    /// Call this before each plugin validation/hover run so `lookupKey` sees
+    /// up-to-date data.
+    pub fn set_workspace_index(&mut self, index: Arc<WorkspaceIndex>) {
+        self.inner.op_state().borrow_mut().put(index);
+    }
+
+    /// Replace the per-file workspace snapshot stored in `OpState`.
+    /// Call this before each plugin run so `getWorkspaceFile` sees up-to-date data.
+    pub fn set_workspace_snapshot(&mut self, snapshot: Arc<WorkspaceFileSnapshot>) {
+        self.inner.op_state().borrow_mut().put(snapshot);
     }
 
     /// Execute a JavaScript snippet, discarding the return value.
@@ -46,5 +367,3 @@ impl ScriptRuntime {
         Ok(serde_json::from_str(&json_str)?)
     }
 }
-
-use anyhow::Context as _;

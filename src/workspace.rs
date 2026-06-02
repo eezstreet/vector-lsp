@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 
 use crate::document::DocumentData;
 use crate::schema::Schema;
 
+
 /// Cross-file symbol index.
 ///
-/// Key: `(file_stem, column_name, cell_value)` — all lowercased for file_stem.
+/// Key: `(file_stem, column_name, cell_value)` — all three components lowercased.
 /// Value: the LSP Location of that cell in the workspace.
 ///
 /// Only columns that are `reference` targets in the schema are stored, keeping
@@ -40,12 +42,13 @@ impl SymbolIndex {
                     Some(h) => h.as_str(),
                     None => continue,
                 };
-                if !ref_targets.contains(&(stem.clone(), col_name.to_string())) {
+                let col_lower = col_name.to_lowercase();
+                if !ref_targets.contains(&(stem.clone(), col_lower.clone())) {
                     continue;
                 }
                 let end_char = cell.col_start + cell.value.chars().count() as u32;
                 self.entries.insert(
-                    (stem.clone(), col_name.to_string(), cell.value.clone()),
+                    (stem.clone(), col_lower, cell.value.to_lowercase()),
                     Location {
                         uri: uri.clone(),
                         range: Range {
@@ -68,8 +71,8 @@ impl SymbolIndex {
     pub fn lookup(&self, file_stem: &str, column: &str, value: &str) -> Option<&Location> {
         self.entries.get(&(
             file_stem.to_lowercase(),
-            column.to_string(),
-            value.to_string(),
+            column.to_lowercase(),
+            value.to_lowercase(),
         ))
     }
 }
@@ -77,12 +80,13 @@ impl SymbolIndex {
 pub struct Workspace {
     pub root_uri: Option<Url>,
     /// Documents currently open in the editor (managed via didOpen/didChange).
-    pub open_documents: HashMap<Url, DocumentData>,
+    pub open_documents: HashMap<Url, Arc<DocumentData>>,
     /// All other workspace files parsed from disk on startup.
-    pub file_cache: HashMap<PathBuf, DocumentData>,
+    pub file_cache: HashMap<PathBuf, Arc<DocumentData>>,
     pub symbols: SymbolIndex,
     /// Schema loaded from the configured schema directory, if any.
-    pub schema: Option<Schema>,
+    /// Stored as `Arc` so it can be shared cheaply with the plugin host.
+    pub schema: Option<Arc<Schema>>,
     /// Cached set of `(file_stem, column_name)` reference targets derived from the schema.
     /// Drives what SymbolIndex stores — populated once when the schema loads.
     pub ref_targets: HashSet<(String, String)>,

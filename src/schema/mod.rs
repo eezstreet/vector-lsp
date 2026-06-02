@@ -155,6 +155,26 @@ impl Schema {
         None
     }
 
+    /// For a `reference` target that is a guide-only (no .txt) file, return the
+    /// valid values from the field's `table` (first column, skipping the header row).
+    /// Returns `None` for real files — their values come from the SymbolIndex.
+    pub fn enum_values_for_target(&self, file_stem: &str, col_name: &str) -> Option<Vec<String>> {
+        let sf = self.get_file(file_stem)?;
+        if !sf.guide_only {
+            return None;
+        }
+        let field = sf.find_field(col_name)?;
+        let table = field.table.as_ref()?;
+        let values: Vec<String> = table
+            .iter()
+            .skip(1) // first row is ["Code", "Description"] header
+            .filter_map(|row| row.first())
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_string())
+            .collect();
+        if values.is_empty() { None } else { Some(values) }
+    }
+
     /// Return the set of `(file_stem, column_name)` pairs that are pointed at by
     /// `reference`-typed fields anywhere in the schema. Drives SymbolIndex population.
     pub fn reference_targets(&self) -> HashSet<(String, String)> {
@@ -164,7 +184,7 @@ impl Schema {
                 if let Some(ft) = &field.field_type {
                     if ft.type_name == FieldTypeName::Reference {
                         if let (Some(file), Some(col)) = (&ft.file, &ft.field) {
-                            targets.insert((file.to_lowercase(), col.clone()));
+                            targets.insert((file.to_lowercase(), col.to_lowercase()));
                         }
                     }
                 }
@@ -242,14 +262,17 @@ fn push_cross_ref(content: &str, out: &mut String) {
 ///   `files["armor"] = { title: "armor.txt", fields: [...], ... }`
 ///
 /// The same `runtime` instance can be kept alive afterwards for plugin execution.
-pub fn load_schema(runtime: &mut ScriptRuntime, dir: &Path) -> Result<Schema> {
+pub fn load_schema(runtime: &mut ScriptRuntime, dir: &Path, patches_dir: Option<&Path>) -> Result<Schema> {
     // Seed the global registry that every schema file writes into.
     runtime.exec("__init__", "var files = {};")?;
 
     let mut paths: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "js"))
+        .filter(|p| {
+            p.extension().map_or(false, |ext| ext == "js")
+                && p.file_name().map_or(true, |n| n != "_patches.js")
+        })
         .collect();
 
     // Sort for deterministic load order (mirrors how a browser would load them).
@@ -257,6 +280,15 @@ pub fn load_schema(runtime: &mut ScriptRuntime, dir: &Path) -> Result<Schema> {
 
     for path in paths {
         runtime.exec_file(&path)?;
+    }
+
+    // Load _patches.js from the plugin directory last, so it can override
+    // anything set by the schema files.
+    if let Some(pd) = patches_dir {
+        let patches = pd.join("_patches.js");
+        if patches.exists() {
+            runtime.exec_file(&patches)?;
+        }
     }
 
     let json = runtime.eval_json("files")?;

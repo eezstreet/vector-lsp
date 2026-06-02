@@ -18,36 +18,6 @@ pub fn validate_document(
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
-    let schema_file = schema.and_then(|s| s.get_file(file_stem));
-
-    // Header-line unknown-column check (line 0).
-    if let (Some(s), Some(sf)) = (schema, schema_file) {
-        let mut col_offset: u32 = 0;
-        for header in &doc.headers {
-            let col_start = col_offset;
-            let col_end = col_start + header.chars().count() as u32;
-            col_offset = col_end + 1; // +1 for delimiter character
-
-            if header.is_empty() {
-                continue;
-            }
-            let known = s.find_field(file_stem, header).is_some()
-                || sf.ignore_fields.iter().any(|ig| ig == header);
-            if !known {
-                diags.push(Diagnostic {
-                    range: Range {
-                        start: Position { line: 0, character: col_start },
-                        end: Position { line: 0, character: col_end },
-                    },
-                    severity: Some(DiagnosticSeverity::INFORMATION),
-                    source: Some("vector-lsp".into()),
-                    message: format!("Column '{header}' is not defined in the schema"),
-                    ..Default::default()
-                });
-            }
-        }
-    }
-
     // Row-level diagnostics.
     for row in &doc.rows {
         for (col_idx, cell) in row.cells.iter().enumerate() {
@@ -76,7 +46,14 @@ pub fn validate_document(
                     if let (Some(ref_file), Some(ref_col)) =
                         (ft.file.as_deref(), ft.field.as_deref())
                     {
-                        if symbols.lookup(ref_file, ref_col, &cell.value).is_none() {
+                        let found = symbols.lookup(ref_file, ref_col, &cell.value).is_some()
+                            || schema
+                                .and_then(|s| s.enum_values_for_target(ref_file, ref_col))
+                                .map(|vals| {
+                                    vals.iter().any(|v| v.eq_ignore_ascii_case(&cell.value))
+                                })
+                                .unwrap_or(false);
+                        if !found {
                             diags.push(Diagnostic {
                                 range: cell_range,
                                 severity: Some(DiagnosticSeverity::ERROR),

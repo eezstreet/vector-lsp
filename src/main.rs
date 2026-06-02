@@ -34,10 +34,23 @@ async fn main() -> anyhow::Result<()> {
     let workspace = Arc::new(RwLock::new(Workspace::new()));
     // PluginHost is Clone (wraps an mpsc::Sender) so it can be shared cheaply
     // across TCP connections without spawning additional threads.
-    let plugin_host = if settings.plugins.is_empty() {
-        None
+    let plugin_host = if let Some(ref dir) = settings.plugin_path {
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("ts") | Some("js")
+                ) && p.file_name().map_or(true, |n| n != "_patches.js")
+            })
+            .collect();
+        paths.sort();
+        if paths.is_empty() { None } else { Some(plugin::PluginHost::new(paths)) }
     } else {
-        Some(plugin::PluginHost::new(settings.plugins.clone()))
+        None
     };
 
     match settings.io_type.clone() {

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -7,7 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Url};
 
 use crate::document::DocumentData;
-use crate::runtime::ScriptRuntime;
+use crate::runtime::{ScriptRuntime, WorkspaceFileSnapshot, WorkspaceIndex};
+use crate::schema::Schema;
 
 // ---------------------------------------------------------------------------
 // Wire types for validate()
@@ -57,17 +59,44 @@ struct RawHover {
 }
 
 // ---------------------------------------------------------------------------
+// Wire type for gotoDefinition()
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RawGotoTarget {
+    #[serde(rename = "targetFile")]
+    target_file: String,
+    #[serde(rename = "targetCol")]
+    target_col: String,
+    #[serde(rename = "targetValue")]
+    target_value: String,
+}
+
+// ---------------------------------------------------------------------------
 // Plugin host (owns the JS runtime on a dedicated non-Send thread)
 // ---------------------------------------------------------------------------
 
 enum PluginRequest {
+    SetSchema {
+        schema: Arc<Schema>,
+    },
     Validate {
         ctx: Value,
+        index: Arc<WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
         reply: oneshot::Sender<Vec<Diagnostic>>,
     },
     Hover {
         ctx: Value,
+        index: Arc<WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
         reply: oneshot::Sender<Option<String>>,
+    },
+    GotoDefinition {
+        ctx: Value,
+        index: Arc<WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
+        reply: oneshot::Sender<Option<(String, String, String)>>,
     },
 }
 
@@ -92,10 +121,29 @@ impl PluginHost {
                 }
             };
 
-            // Seed both plugin registries in the JS global scope.
+            // Seed plugin registries and host-provided utility functions.
             let _ = rt.exec(
                 "__seed__",
-                "var __plugins = []; var __hovers = []; var validate; var hover;",
+                "var __plugins = []; var __hovers = []; var __gotos = [];\
+                 var validate; var hover; var gotoDefinition;\
+                 function lookupKey(file,col,value){\
+                     return Deno.core.ops.op_lookup_key(file,col,value);\
+                 }\
+                 function getColumn(file,col){\
+                     return Deno.core.ops.op_get_column(file,col)||undefined;\
+                 }\
+                 function hasFile(stem){\
+                     return Deno.core.ops.op_has_file(stem);\
+                 }\
+                 function getColumnValues(stem,col){\
+                     return Deno.core.ops.op_get_column_values(stem,col);\
+                 }\
+                 function getFilteredColumnValues(stem,valueCol,filterCol,filterValue){\
+                     return Deno.core.ops.op_get_filtered_column_values(stem,valueCol,filterCol,filterValue);\
+                 }\
+                 function getEnumTable(file,col){\
+                     return Deno.core.ops.op_get_enum_table(file,col)||null;\
+                 }",
             );
 
             for path in &paths {
@@ -106,7 +154,12 @@ impl PluginHost {
 
             while let Some(req) = rx.blocking_recv() {
                 match req {
-                    PluginRequest::Validate { ctx, reply } => {
+                    PluginRequest::SetSchema { schema } => {
+                        rt.set_schema(schema);
+                    }
+                    PluginRequest::Validate { ctx, index, snapshot, reply } => {
+                        rt.set_workspace_index(index);
+                        rt.set_workspace_snapshot(snapshot);
                         let ctx_json = ctx.to_string();
                         let expr = format!(
                             "__plugins.flatMap(function(fn){{\
@@ -123,7 +176,9 @@ impl PluginHost {
                             .collect();
                         let _ = reply.send(diags);
                     }
-                    PluginRequest::Hover { ctx, reply } => {
+                    PluginRequest::Hover { ctx, index, snapshot, reply } => {
+                        rt.set_workspace_index(index);
+                        rt.set_workspace_snapshot(snapshot);
                         let ctx_json = ctx.to_string();
                         // Call each hover function in turn; return the first non-null result.
                         let expr = format!(
@@ -146,6 +201,28 @@ impl PluginHost {
                         });
                         let _ = reply.send(result);
                     }
+                    PluginRequest::GotoDefinition { ctx, index, snapshot, reply } => {
+                        rt.set_workspace_index(index);
+                        rt.set_workspace_snapshot(snapshot);
+                        let ctx_json = ctx.to_string();
+                        // Call each gotoDefinition function in turn; return the first non-null result.
+                        let expr = format!(
+                            "(function(ctx){{\
+                                for(var i=0;i<__gotos.length;i++){{\
+                                    try{{var r=__gotos[i](ctx);if(r!=null)return r;}}catch(e){{}}\
+                                }}\
+                                return null;\
+                            }})({ctx_json})"
+                        );
+                        let result = rt.eval_json(&expr).ok().and_then(|v| match v {
+                            Value::Null => None,
+                            Value::Object(_) => serde_json::from_value::<RawGotoTarget>(v)
+                                .ok()
+                                .map(|t| (t.target_file, t.target_col, t.target_value)),
+                            _ => None,
+                        });
+                        let _ = reply.send(result);
+                    }
                 }
             }
         });
@@ -153,19 +230,60 @@ impl PluginHost {
         Self { tx }
     }
 
+    /// Push the loaded schema to the plugin thread so `getEnumTable` has data.
+    /// Fire-and-forget: the schema is immutable after loading so ordering with
+    /// subsequent validate/hover calls (which are queued after this) is fine.
+    pub async fn set_schema(&self, schema: Arc<Schema>) {
+        let _ = self.tx.send(PluginRequest::SetSchema { schema }).await;
+    }
+
     /// Run all `validate` plugin functions and return any diagnostics.
-    pub async fn run(&self, ctx: Value) -> Vec<Diagnostic> {
+    pub async fn run(
+        &self,
+        ctx: Value,
+        index: Arc<WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
+    ) -> Vec<Diagnostic> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.tx.send(PluginRequest::Validate { ctx, reply: reply_tx }).await.is_err() {
+        if self
+            .tx
+            .send(PluginRequest::Validate { ctx, index, snapshot, reply: reply_tx })
+            .await
+            .is_err()
+        {
             return vec![];
         }
         reply_rx.await.unwrap_or_default()
     }
 
     /// Run all `hover` plugin functions and return the first non-null markdown content.
-    pub async fn hover(&self, ctx: Value) -> Option<String> {
+    pub async fn hover(
+        &self,
+        ctx: Value,
+        index: Arc<WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
+    ) -> Option<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx.send(PluginRequest::Hover { ctx, reply: reply_tx }).await.ok()?;
+        self.tx
+            .send(PluginRequest::Hover { ctx, index, snapshot, reply: reply_tx })
+            .await
+            .ok()?;
+        reply_rx.await.ok().flatten()
+    }
+
+    /// Run all `gotoDefinition` plugin functions and return the first non-null
+    /// `(target_file, target_col, target_value)` triple.
+    pub async fn goto_definition(
+        &self,
+        ctx: Value,
+        index: Arc<WorkspaceIndex>,
+        snapshot: Arc<WorkspaceFileSnapshot>,
+    ) -> Option<(String, String, String)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(PluginRequest::GotoDefinition { ctx, index, snapshot, reply: reply_tx })
+            .await
+            .ok()?;
         reply_rx.await.ok().flatten()
     }
 }
@@ -178,7 +296,8 @@ fn load_plugin(rt: &mut ScriptRuntime, path: &Path) -> anyhow::Result<()> {
     rt.exec(
         "__register__",
         "if(typeof validate==='function'){__plugins.push(validate);validate=undefined;}\
-         if(typeof hover==='function'){__hovers.push(hover);hover=undefined;}",
+         if(typeof hover==='function'){__hovers.push(hover);hover=undefined;}\
+         if(typeof gotoDefinition==='function'){__gotos.push(gotoDefinition);gotoDefinition=undefined;}",
     )?;
     Ok(())
 }
@@ -194,16 +313,15 @@ fn load_plugin(rt: &mut ScriptRuntime, path: &Path) -> anyhow::Result<()> {
 /// {
 ///   "file": "cubemain",
 ///   "headers": ["enabled", ...],
-///   "rows": [{ "__line": 1, "__colstarts": { "enabled": 0 }, "enabled": "1", ... }],
-///   "workspace": { "armor": { "headers": [...], "rows": [...] }, ... }
+///   "rows": [{ "__line": 1, "__colstarts": { "enabled": 0 }, "enabled": "1", ... }]
 /// }
 /// ```
-pub fn build_context(file_stem: &str, doc: &DocumentData, workspace: Value) -> Value {
+/// Workspace data is NOT included here; plugins access it via `getWorkspaceFile(stem)`.
+pub fn build_context(file_stem: &str, doc: &DocumentData) -> Value {
     json!({
         "file": file_stem,
         "headers": doc.headers,
         "rows": rows_to_json(doc),
-        "workspace": workspace,
     })
 }
 
@@ -216,17 +334,16 @@ pub fn build_context(file_stem: &str, doc: &DocumentData, workspace: Value) -> V
 ///   "col": "numinputs",
 ///   "value": "3",
 ///   "rowLine": 5,
-///   "row": { "enabled": "1", "numinputs": "3", ... },
-///   "workspace": { ... }
+///   "row": { "enabled": "1", "numinputs": "3", ... }
 /// }
 /// ```
+/// Workspace data is NOT included; plugins access it via `getWorkspaceFile(stem)`.
 pub fn build_hover_context(
     file_stem: &str,
     col_name: &str,
     cell_value: &str,
     row_line: u32,
     doc: &DocumentData,
-    workspace: Value,
 ) -> Value {
     let row = doc.rows.iter().find(|r| r.line == row_line);
     let row_obj: serde_json::Map<String, Value> = row
@@ -250,18 +367,17 @@ pub fn build_hover_context(
         "value": cell_value,
         "rowLine": row_line,
         "row": Value::Object(row_obj),
-        "workspace": workspace,
     })
 }
 
-/// Serialise workspace file data for plugin contexts.
-/// Open documents take precedence over the file cache so that in-editor edits
-/// are visible to cross-file plugin checks.
-pub fn workspace_to_json(
-    open_docs: &HashMap<Url, DocumentData>,
-    file_cache: &HashMap<PathBuf, DocumentData>,
-) -> Value {
-    let mut map = serde_json::Map::new();
+/// Build a per-file snapshot for plugin ops.
+/// Open documents shadow file-cache entries for the same stem.
+/// No serialization happens here — ops serialize only the data they need on demand.
+pub fn build_workspace_snapshot(
+    open_docs: &HashMap<Url, Arc<DocumentData>>,
+    file_cache: &HashMap<PathBuf, Arc<DocumentData>>,
+) -> Arc<WorkspaceFileSnapshot> {
+    let mut snap = WorkspaceFileSnapshot::new();
 
     for (path, doc) in file_cache {
         if let Some(stem) = path
@@ -269,7 +385,7 @@ pub fn workspace_to_json(
             .and_then(|s| s.to_str())
             .map(|s| s.to_lowercase())
         {
-            map.entry(stem).or_insert_with(|| doc_to_json(doc));
+            snap.files.entry(stem).or_insert_with(|| Arc::clone(doc));
         }
     }
 
@@ -280,15 +396,11 @@ pub fn workspace_to_json(
             .and_then(|n| n.rfind('.').map(|i| n[..i].to_lowercase()))
             .unwrap_or_default();
         if !stem.is_empty() {
-            map.insert(stem, doc_to_json(doc));
+            snap.files.insert(stem, Arc::clone(doc));
         }
     }
 
-    Value::Object(map)
-}
-
-fn doc_to_json(doc: &DocumentData) -> Value {
-    json!({ "headers": doc.headers, "rows": rows_to_json(doc) })
+    Arc::new(snap)
 }
 
 fn rows_to_json(doc: &DocumentData) -> Vec<Value> {
@@ -324,9 +436,6 @@ fn rows_to_json(doc: &DocumentData) -> Vec<Value> {
 // Known remaining limitations (uncommon in plugin code):
 //   - Generic type parameters on functions: `function f<T>()` — the `<T>` is
 //     not stripped.  Avoid or pre-compile.
-//   - Variable/`const` type annotations inside function bodies with braced
-//     arrow callbacks (`(row) => { const n: number = ... }`).  Use type
-//     inference (omit the annotation) or pre-compile.
 //   - Brace counting inside removed structural blocks ignores strings/comments.
 
 /// Full TypeScript → JavaScript preprocessor.  Chains structural stripping then
@@ -391,7 +500,7 @@ fn strip_ts_inline(src: &str) -> String {
             out.push(ch); i += 1; continue;
         }
 
-        // ---- `?` — ternary, optional chaining, or optional parameter --------
+        // ---- `?` — ternary, optional chaining, optional parameter, or `??` ----
         if ch == '?' {
             let next = chars.get(i + 1).copied();
             if next == Some(':') {
@@ -402,6 +511,10 @@ fn strip_ts_inline(src: &str) -> String {
             if next == Some('.') {
                 // Optional chaining `?.` — keep as-is
                 out.push(ch); i += 1; continue;
+            }
+            if next == Some('?') {
+                // Nullish coalescing `??` (or `??=`) — not a ternary; consume both `?`s
+                out.push(ch); out.push('?'); i += 2; continue;
             }
             // Ternary `?`
             if let Some(top) = ternary.last_mut() { *top = true; }
@@ -433,7 +546,17 @@ fn strip_ts_inline(src: &str) -> String {
                     c.is_alphabetic() || c == '_' || matches!(c, '(' | '[' | '{' | '"' | '\'')
                 });
 
-            if depth_ok && prev_ok && next_ok {
+            // Also strip `const x: T`, `let x: T`, `var x: T` inside function
+            // bodies where depth_ok would otherwise be false.
+            let var_decl_ok = !depth_ok && prev_out.map_or(false, is_id) && {
+                let trimmed = out.trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
+                let before_id = trimmed.trim_end_matches(|c: char| is_id(c));
+                let before_id = before_id.trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
+                let kw_start = before_id.rfind(|c: char| !is_id(c)).map(|i| i + 1).unwrap_or(0);
+                matches!(&before_id[kw_start..], "const" | "let" | "var")
+            };
+
+            if (depth_ok || var_decl_ok) && prev_ok && next_ok {
                 let is_return = prev_out == Some(')');
                 i += 1; // skip `:`
                 i = skip_ws(&chars, i);
@@ -794,6 +917,35 @@ mod tests {
         );
         assert!(out.contains("(row)"), "arrow param type stripped, got: {out}");
         assert!(out.contains("(ctx)"), "outer param type stripped, got: {out}");
+    }
+
+    #[test]
+    fn nullish_coalescing_does_not_poison_ternary() {
+        // `??` must not set the pending-ternary flag; a later `:` return-type
+        // annotation must still be stripped.
+        let src = "function f() { const x = a ?? 0; }\nfunction g(): string | null { return null; }";
+        let out = strip_typescript(src);
+        assert!(out.contains("function g()"), "return type stripped, got: {out}");
+        assert!(!out.contains(": string"), "return type stripped, got: {out}");
+        assert!(out.contains("return null"), "body preserved, got: {out}");
+    }
+
+    #[test]
+    fn strips_const_type_in_function_body() {
+        let out = strip_typescript(
+            "function f() {\n    const tokens: string[] = [];\n    let n: number = 0;\n    var m: Record<string, number> = {};\n    return tokens;\n}",
+        );
+        assert!(out.contains("const tokens= []"), "const type stripped, got: {out}");
+        assert!(out.contains("let n= 0"), "let type stripped, got: {out}");
+        assert!(out.contains("var m= {}"), "var type stripped, got: {out}");
+        assert!(out.contains("return tokens"), "body preserved, got: {out}");
+    }
+
+    #[test]
+    fn preserves_object_literal_in_var_decl() {
+        // `const x = { key: value }` — the rename colon must NOT be stripped
+        let out = strip_typescript("function f() { const x = { key: value }; }");
+        assert!(out.contains("key: value"), "object literal preserved, got: {out}");
     }
 
     #[test]
