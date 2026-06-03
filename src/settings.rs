@@ -74,6 +74,11 @@ pub struct VectorLspSettings {
     pub schema_path: Option<PathBuf>,
     /// Directory to scan for plugin files (*.ts / *.js).
     pub plugin_path: Option<PathBuf>,
+    /// Workspace directory to use in single-shot mode (and optionally in LSP mode).
+    pub workspace_path: Option<PathBuf>,
+    /// When true, validate the workspace and exit instead of starting the LSP server.
+    #[serde(default)]
+    pub single_shot: bool,
 }
 
 impl VectorLspSettings {
@@ -91,6 +96,8 @@ impl Default for VectorLspSettings {
             extension: default_extension(),
             schema_path: None,
             plugin_path: None,
+            workspace_path: None,
+            single_shot: false,
         }
     }
 }
