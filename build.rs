@@ -3,6 +3,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=contrib/d2rdoc/sync-schemas.ps1");
+    println!("cargo:rerun-if-changed=contrib/");
 
     if std::env::var("CARGO_FEATURE_D2RDOC").is_err() {
         return;
@@ -32,6 +33,8 @@ fn main() {
             ),
         }
     }
+
+    copy_contrib_to_target();
 }
 
 /// Returns true if at least one contrib/d2rdoc/<version>/schema/ directory
@@ -52,4 +55,39 @@ fn schemas_present() -> bool {
         }
     }
     false
+}
+
+/// Copy the contrib/ tree into the profile output directory (e.g.
+/// target/release/) so the binary and its runtime assets are co-located.
+///
+/// OUT_DIR is target/{profile}/build/vector-lsp-{hash}/out — four levels up
+/// is target/{profile}/.
+fn copy_contrib_to_target() {
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
+    let target_profile_dir = Path::new(&out_dir)
+        .ancestors()
+        .nth(3)
+        .expect("unexpected OUT_DIR depth")
+        .to_owned();
+
+    copy_dir_recursive(Path::new("contrib"), &target_profile_dir.join("contrib"));
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    std::fs::create_dir_all(dst).expect("failed to create output dir");
+    for entry in entries.flatten() {
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path);
+        } else {
+            std::fs::copy(&src_path, &dst_path).unwrap_or_else(|e| {
+                println!("cargo:warning=Failed to copy {}: {e}", src_path.display());
+                0
+            });
+        }
+    }
 }
