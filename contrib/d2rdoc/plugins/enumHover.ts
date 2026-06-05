@@ -1,4 +1,4 @@
-/// <reference path="./vector-lsp-plugin.d.ts" />
+/// <reference path="../../vector-lsp-plugin.d.ts" />
 
 // Shows the enum table entry when hovering over a cell in a column that has
 // a table defined in the schema (e.g. "op" in cubemain.txt, "srvstfunc" in

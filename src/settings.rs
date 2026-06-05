@@ -74,6 +74,15 @@ pub struct VectorLspSettings {
     pub schema_path: Option<PathBuf>,
     /// Directory to scan for plugin files (*.ts / *.js).
     pub plugin_path: Option<PathBuf>,
+    /// Schema loader driver to use. Must match a registered `LoaderEntry::id`.
+    /// Defaults to `"d2rdoc"` (the built-in JavaScript schema format).
+    #[serde(default = "default_schema_loader")]
+    pub schema_loader: String,
+    /// Selects which bundled schema/plugin set to use when `schema_path` and
+    /// `plugin_path` are not set. E.g. `"d2r-2.7"`. The name `"plugins"` is
+    /// reserved and cannot be used as a variant name.
+    #[serde(default)]
+    pub schema_variant: String,
     /// Workspace directory to use in single-shot mode (and optionally in LSP mode).
     pub workspace_path: Option<PathBuf>,
     /// When true, validate the workspace and exit instead of starting the LSP server.
@@ -98,8 +107,14 @@ impl Default for VectorLspSettings {
             plugin_path: None,
             workspace_path: None,
             single_shot: false,
+            schema_loader: default_schema_loader(),
+            schema_variant: String::new(),
         }
     }
+}
+
+fn default_schema_loader() -> String {
+    "d2rdoc".to_string()
 }
 
 fn default_delimiter() -> String {

@@ -1,5 +1,6 @@
 mod backend;
 mod cli;
+mod contrib;
 mod diagnostics;
 mod document;
 mod plugin;
@@ -19,10 +20,44 @@ use tower_lsp::{LspService, Server};
 
 use cli::CliArgs;
 use document::DocumentData;
-use runtime::ScriptRuntime;
-use schema::load_schema;
+use schema::find_loader;
 use settings::{IoType, VectorLspSettings};
 use workspace::{SymbolIndex, Workspace};
+
+/// Append sorted .ts/.js plugin files from `dir` to `out`, skipping `_patches.js`.
+fn scan_plugin_dir(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut found: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            matches!(p.extension().and_then(|e| e.to_str()), Some("ts") | Some("js"))
+                && p.file_name().map_or(true, |n| n != "_patches.js")
+        })
+        .collect();
+    found.sort();
+    out.extend(found);
+}
+
+/// Collect plugin file paths in tier order: base → variant → explicit override.
+fn collect_plugin_paths(settings: &VectorLspSettings) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    // Ask the loader for its default plugin directories (base + variant).
+    if let Ok(loader) = find_loader(
+        &settings.schema_loader,
+        settings.schema_variant.clone(),
+        settings.plugin_path.clone(),
+    ) {
+        for dir in loader.default_plugin_dirs() {
+            scan_plugin_dir(&dir, &mut paths);
+        }
+    }
+    // Explicit plugin_path is additive on top of the defaults.
+    if let Some(ref dir) = settings.plugin_path {
+        scan_plugin_dir(dir, &mut paths);
+    }
+    paths
+}
 
 /// Run a one-shot workspace check: scan all data files, validate them, print diagnostics, and
 /// return an exit code (0 = clean, 1 = errors found, 2 = configuration/IO error).
@@ -35,16 +70,18 @@ async fn run_check(settings: &VectorLspSettings) -> i32 {
         }
     };
 
-    // Load schema if configured.
-    let schema_result = if let Some(schema_path) = &settings.schema_path {
-        let schema_path = schema_path.clone();
-        let plugin_path = settings.plugin_path.clone();
-        match tokio::task::spawn_blocking(move || {
-            ScriptRuntime::new()
-                .and_then(|mut rt| load_schema(&mut rt, &schema_path, plugin_path.as_deref()))
-        })
-        .await
-        {
+    // Load schema if a path or variant is configured.
+    let schema_result = if settings.schema_path.is_some() || !settings.schema_variant.is_empty() {
+        let loader = match find_loader(
+            &settings.schema_loader,
+            settings.schema_variant.clone(),
+            settings.plugin_path.clone(),
+        ) {
+            Ok(l) => l,
+            Err(e) => { eprintln!("error: {e}"); return 2; }
+        };
+        let schema_path = settings.schema_path.clone();
+        match tokio::task::spawn_blocking(move || loader.load(schema_path.as_deref())).await {
             Ok(Ok(s)) => {
                 eprintln!("Schema loaded.");
                 Some(Arc::new(s))
@@ -165,23 +202,11 @@ async fn main() -> anyhow::Result<()> {
     let workspace = Arc::new(RwLock::new(Workspace::new()));
     // PluginHost is Clone (wraps an mpsc::Sender) so it can be shared cheaply
     // across TCP connections without spawning additional threads.
-    let plugin_host = if let Some(ref dir) = settings.plugin_path {
-        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                matches!(
-                    p.extension().and_then(|e| e.to_str()),
-                    Some("ts") | Some("js")
-                ) && p.file_name().map_or(true, |n| n != "_patches.js")
-            })
-            .collect();
-        paths.sort();
-        if paths.is_empty() { None } else { Some(plugin::PluginHost::new(paths)) }
-    } else {
+    let plugin_paths = collect_plugin_paths(&settings);
+    let plugin_host = if plugin_paths.is_empty() {
         None
+    } else {
+        Some(plugin::PluginHost::new(plugin_paths))
     };
 
     match settings.io_type.clone() {

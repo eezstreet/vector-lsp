@@ -3,8 +3,13 @@ name = "vector-lsp"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["d2rdoc"]
+d2rdoc = []
+
 [dependencies]
 anyhow = "1.0.102"
+inventory = "0.3"
 clap = { version = "4.6.1", features = ["derive"] }
 config = "0.15.22"
 deno_core = "0.311.0"

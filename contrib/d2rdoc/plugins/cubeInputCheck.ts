@@ -1,4 +1,4 @@
-/// <reference path="./vector-lsp-plugin.d.ts" />
+/// <reference path="../../vector-lsp-plugin.d.ts" />
 
 // Validates "input #" fields in cubemain.txt.
 //

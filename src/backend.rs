@@ -7,8 +7,8 @@ use tower_lsp::{jsonrpc::Result as LspResult, Client, LanguageServer};
 use crate::diagnostics;
 use crate::document::DocumentData;
 use crate::plugin;
-use crate::runtime::{self, ScriptRuntime};
-use crate::schema::{format_description, load_schema, FieldTypeName};
+use crate::runtime;
+use crate::schema::{find_loader, format_description, FieldTypeName};
 use crate::settings::VectorLspSettings;
 use crate::workspace::Workspace;
 
@@ -199,11 +199,23 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        if let Some(path) = self.settings.schema_path.clone() {
-            let plugin_path = self.settings.plugin_path.clone();
+        let has_schema = self.settings.schema_path.is_some()
+            || !self.settings.schema_variant.is_empty();
+        if has_schema {
+            let loader = match find_loader(
+                &self.settings.schema_loader,
+                self.settings.schema_variant.clone(),
+                self.settings.plugin_path.clone(),
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    self.client.log_message(MessageType::ERROR, format!("{e}")).await;
+                    return;
+                }
+            };
+            let schema_path = self.settings.schema_path.clone();
             let result = tokio::task::spawn_blocking(move || {
-                ScriptRuntime::new()
-                    .and_then(|mut rt| load_schema(&mut rt, &path, plugin_path.as_deref()))
+                loader.load(schema_path.as_deref())
             })
             .await;
 

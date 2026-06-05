@@ -1,17 +1,42 @@
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+mod format;
+pub mod registry;
 
-use anyhow::{anyhow, Result};
+pub use format::format_description;
+pub use registry::find_loader;
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
 use serde::Deserialize;
 
-use crate::runtime::ScriptRuntime;
+// ---------------------------------------------------------------------------
+// Loader trait
+// ---------------------------------------------------------------------------
+
+/// Implemented by each contrib schema driver.
+///
+/// A driver reads a schema directory (whose layout and file format it defines)
+/// and returns a fully-populated `Schema`. The driver is selected at startup by
+/// the `schema_loader` config key.
+pub trait SchemaLoader: Send + Sync {
+    /// Short identifier used in config to select this driver (e.g. `"d2rdoc"`).
+    fn id(&self) -> &'static str;
+    /// Load a schema from `dir`, or auto-discover the schema directory if `None`.
+    /// May block on IO.
+    fn load(&self, dir: Option<&Path>) -> anyhow::Result<Schema>;
+    /// Directories to scan for plugin files, in load order (lowest priority first).
+    /// Called before `load()` so the plugin host can be set up before the LSP
+    /// server starts. The caller appends any explicit `plugin_path` from settings.
+    fn default_plugin_dirs(&self) -> Vec<PathBuf> {
+        vec![]
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Schema types
 // ---------------------------------------------------------------------------
 
 /// The primitive type of a field's value, as declared in the schema.
-/// Covers all distinct `type` strings observed in the d2rdoc schema files.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldTypeName {
@@ -73,15 +98,15 @@ pub struct SchemaField {
     pub table: Option<Vec<Vec<serde_json::Value>>>,
 }
 
-/// Top-level schema entry for a single .txt file (or a reference-only pseudo-file).
+/// Top-level schema entry for a single data file (or a reference-only pseudo-file).
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SchemaFile {
-    /// Human-readable title (usually the .txt filename).
+    /// Human-readable title (usually the filename).
     pub title: Option<String>,
     /// Human-readable overview of what this file controls.
     pub overview: Option<String>,
-    /// If true, this entry is a reference table only and has no corresponding .txt file.
+    /// If true, this entry is a reference table only and has no corresponding data file.
     #[serde(default)]
     pub guide_only: bool,
     /// Schema files whose fields are merged into this one for reference purposes.
@@ -93,10 +118,9 @@ pub struct SchemaFile {
     /// Ordered column definitions for this file.
     #[serde(default)]
     pub fields: Vec<SchemaField>,
-    /// Columns that exist in the .txt but are intentionally undocumented / ignored.
+    /// Columns that exist in the data file but are intentionally undocumented / ignored.
     #[serde(default)]
     pub ignore_fields: Vec<String>,
-    /// The schema file that this one depends on for code-level implementation.
     pub code_dependency: Option<String>,
     #[serde(default)]
     pub not_searchable: bool,
@@ -120,7 +144,7 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// Look up the schema entry for a file, by its stem (e.g. `"armor"` for `armor.txt`).
+    /// Look up the schema entry for a file by its stem (e.g. `"armor"` for `armor.txt`).
     pub fn get_file(&self, stem: &str) -> Option<&SchemaFile> {
         self.files.get(stem).or_else(|| self.files.get(&stem.to_lowercase()))
     }
@@ -139,13 +163,12 @@ impl Schema {
         visited: &mut HashSet<String>,
     ) -> Option<&'a SchemaField> {
         if !visited.insert(file_stem.to_lowercase()) {
-            return None; // cycle guard
+            return None;
         }
         let sf = self.get_file(file_stem)?;
         if let Some(f) = sf.find_field(col_name) {
             return Some(f);
         }
-        // Walk appendFiles so that fields shared across multiple files are found.
         let appended = sf.append_files.clone();
         for stem in &appended {
             if let Some(f) = self.find_field_inner(stem, col_name, visited) {
@@ -155,7 +178,7 @@ impl Schema {
         None
     }
 
-    /// For a `reference` target that is a guide-only (no .txt) file, return the
+    /// For a `reference` target that is a guide-only (no data file) entry, return the
     /// valid values from the field's `table` (first column, skipping the header row).
     /// Returns `None` for real files — their values come from the SymbolIndex.
     pub fn enum_values_for_target(&self, file_stem: &str, col_name: &str) -> Option<Vec<String>> {
@@ -167,7 +190,7 @@ impl Schema {
         let table = field.table.as_ref()?;
         let values: Vec<String> = table
             .iter()
-            .skip(1) // first row is ["Code", "Description"] header
+            .skip(1)
             .filter_map(|row| row.first())
             .filter_map(|v| v.as_str())
             .map(|s| s.to_string())
@@ -192,115 +215,4 @@ impl Schema {
         }
         targets
     }
-}
-
-// ---------------------------------------------------------------------------
-// Description formatting
-// ---------------------------------------------------------------------------
-
-/// Format a schema description string for display in LSP hover output.
-///
-/// Handles two transformations:
-/// - `<br>` / `<br/>` / `<br />` HTML line-break tags → Markdown double newline
-/// - `$!file#field!$` cross-reference syntax → Markdown emphasis/code formatting
-///   - `$!enums#EARMORTYPE!$`  →  `` `EARMORTYPE` (in *enums*) ``
-///   - `$!monstats!$`          →  `*monstats*`
-///   - `$!#Id!$`               →  `` `Id` ``
-pub fn format_description(text: &str) -> String {
-    let text = text
-        .replace("<br />", "\n\n")
-        .replace("<br/>", "\n\n")
-        .replace("<br>", "\n\n");
-
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text.as_str();
-
-    while let Some(start) = rest.find("$!") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        match after.find("!$") {
-            Some(end) => {
-                push_cross_ref(&after[..end], &mut out);
-                rest = &after[end + 2..];
-            }
-            None => {
-                // No closing marker — emit literally and stop scanning.
-                out.push_str("$!");
-                rest = after;
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-fn push_cross_ref(content: &str, out: &mut String) {
-    match content.find('#') {
-        Some(i) => {
-            let file  = &content[..i];
-            let field = &content[i + 1..];
-            match (file.is_empty(), field.is_empty()) {
-                (false, false) => out.push_str(&format!("`{}` (in *{}*)", field, file)),
-                (false, true)  => out.push_str(&format!("*{}*", file)),
-                (true,  false) => out.push_str(&format!("`{}`", field)),
-                (true,  true)  => {}
-            }
-        }
-        None if !content.is_empty() => out.push_str(&format!("*{}*", content)),
-        _ => {}
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Loader
-// ---------------------------------------------------------------------------
-
-/// Load every `.js` file from `dir` into `runtime` and return the resulting schema.
-///
-/// Each JS file is expected to assign into a global `files` object:
-///   `files["armor"] = { title: "armor.txt", fields: [...], ... }`
-///
-/// The same `runtime` instance can be kept alive afterwards for plugin execution.
-pub fn load_schema(runtime: &mut ScriptRuntime, dir: &Path, patches_dir: Option<&Path>) -> Result<Schema> {
-    // Seed the global registry that every schema file writes into.
-    runtime.exec("__init__", "var files = {};")?;
-
-    let mut paths: Vec<_> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().map_or(false, |ext| ext == "js")
-                && p.file_name().map_or(true, |n| n != "_patches.js")
-        })
-        .collect();
-
-    // Sort for deterministic load order (mirrors how a browser would load them).
-    paths.sort();
-
-    for path in paths {
-        runtime.exec_file(&path)?;
-    }
-
-    // Load _patches.js from the plugin directory last, so it can override
-    // anything set by the schema files.
-    if let Some(pd) = patches_dir {
-        let patches = pd.join("_patches.js");
-        if patches.exists() {
-            runtime.exec_file(&patches)?;
-        }
-    }
-
-    let json = runtime.eval_json("files")?;
-    // Deserialize entry-by-entry so we can report which key fails.
-    let map = json.as_object().ok_or_else(|| anyhow!("files is not an object"))?;
-    let mut files: HashMap<String, SchemaFile> = HashMap::new();
-    for (key, val) in map {
-        if val.is_null() { continue; }
-        match serde_json::from_value::<SchemaFile>(val.clone()) {
-            Ok(sf) => { files.insert(key.clone(), sf); }
-            Err(e) => return Err(anyhow!("schema key '{}': {}", key, e)),
-        }
-    }
-    Ok(Schema { files })
 }

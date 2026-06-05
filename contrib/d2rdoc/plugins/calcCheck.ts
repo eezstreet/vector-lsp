@@ -1,4 +1,4 @@
-/// <reference path="./vector-lsp-plugin.d.ts" />
+/// <reference path="../../vector-lsp-plugin.d.ts" />
 
 // Validates BBE calc formula syntax for every column listed in the BBE field
 // map below.  Scope identifiers (Skill / Missile / Monster) are read live from

@@ -1,4 +1,4 @@
-/// <reference path="./vector-lsp-plugin.d.ts" />
+/// <reference path="../../vector-lsp-plugin.d.ts" />
 
 // Validates fields that must contain a valid item code (weapons/armor/misc)
 // but are typed as plain text in the schema because they resolve against

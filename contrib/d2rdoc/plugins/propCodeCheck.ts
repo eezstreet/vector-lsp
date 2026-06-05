@@ -1,4 +1,4 @@
-/// <reference path="./vector-lsp-plugin.d.ts" />
+/// <reference path="../../vector-lsp-plugin.d.ts" />
 
 // Validates fields that must contain a valid property code (properties.txt or
 // propertygroups.txt).
