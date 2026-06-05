@@ -2,6 +2,11 @@
 name = "vector-lsp"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/eezstreet/vector-lsp"
+
+[package.metadata.dist]
+features = ["d2rdoc"]
+include = ["contrib/"]
 
 [features]
 default = ["d2rdoc"]
@@ -17,3 +22,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.52.2", features = ["full"] }
 tower-lsp = "0.20.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

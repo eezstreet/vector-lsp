@@ -2,6 +2,12 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    // V8 (via deno_core) uses ETW and registry APIs that live in advapi32.
+    // When cargo builds with an explicit --target triple (as cargo-dist does),
+    // the MSVC default-lib resolution doesn't always pull this in automatically.
+    #[cfg(windows)]
+    println!("cargo:rustc-link-lib=advapi32");
+
     println!("cargo:rerun-if-changed=contrib/d2rdoc/sync-schemas.ps1");
     println!("cargo:rerun-if-changed=contrib/");
 
