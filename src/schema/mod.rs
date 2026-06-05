@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
 use crate::runtime::ScriptRuntime;
@@ -292,6 +292,15 @@ pub fn load_schema(runtime: &mut ScriptRuntime, dir: &Path, patches_dir: Option<
     }
 
     let json = runtime.eval_json("files")?;
-    let files: HashMap<String, SchemaFile> = serde_json::from_value(json)?;
+    // Deserialize entry-by-entry so we can report which key fails.
+    let map = json.as_object().ok_or_else(|| anyhow!("files is not an object"))?;
+    let mut files: HashMap<String, SchemaFile> = HashMap::new();
+    for (key, val) in map {
+        if val.is_null() { continue; }
+        match serde_json::from_value::<SchemaFile>(val.clone()) {
+            Ok(sf) => { files.insert(key.clone(), sf); }
+            Err(e) => return Err(anyhow!("schema key '{}': {}", key, e)),
+        }
+    }
     Ok(Schema { files })
 }

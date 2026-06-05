@@ -151,9 +151,11 @@ async fn main() -> anyhow::Result<()> {
         .add_source(Environment::with_prefix("VLSP"))
         .build()?;
 
-    let settings = Arc::new(
-        raw.try_deserialize::<VectorLspSettings>().unwrap_or_default(),
-    );
+    let mut settings = raw.try_deserialize::<VectorLspSettings>().unwrap_or_default();
+    if let Some(schema_path) = args.schema_path {
+        settings.schema_path = Some(schema_path);
+    }
+    let settings = Arc::new(settings);
 
     if settings.single_shot || args.single_shot {
         let code = run_check(&settings).await;

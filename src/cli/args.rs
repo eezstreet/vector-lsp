@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -7,4 +8,7 @@ pub struct CliArgs {
     /// Validate the workspace and exit (overrides the config `single_shot` setting).
     #[arg(long)]
     pub single_shot: bool,
+    /// Path to the schema directory (overrides the config `schema_path` setting).
+    #[arg(long)]
+    pub schema_path: Option<PathBuf>,
 }
