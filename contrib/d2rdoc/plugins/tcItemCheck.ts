@@ -201,13 +201,67 @@ function hover(ctx: HoverContext): HoverResult | null {
     if (ctx.file !== "treasureclassex") return null;
     if (!ctx.col.toLocaleLowerCase().startsWith("item")) return null;
 
-    const names = getFilteredColumnValues("weapons", "name", "code", ctx.value).concat(
-        getFilteredColumnValues("armor", "name", "code", ctx.value),
-        getFilteredColumnValues("misc", "name", "code", ctx.value),
-        getFilteredColumnValues("itemtypes", "name", "code", ctx.value.substring(0, ctx.value.length - 1))
-    );
-    const name = names[0];
-    if (!name) return null;
+    // Strip outer quotes and modifiers to isolate the base token.
+    let raw = ctx.value.trim();
+    if (raw.startsWith('"') && raw.endsWith('"')) {
+        raw = raw.slice(1, -1).trim();
+    }
+    const [base] = splitModifiers(raw);
+    if (!base) return null;
 
-    return { content: ctx.value + "\n\n" + name };
+    // Item code (weapons / armor / misc)
+    const names = getFilteredColumnValues("weapons", "name", "code", base).concat(
+        getFilteredColumnValues("armor", "name", "code", base),
+        getFilteredColumnValues("misc",  "name", "code", base)
+    );
+    if (names.length > 0) {
+        return { content: base + "\n\n" + names[0] };
+    }
+
+    // Item type (exact Code match, e.g. "weap", "armo")
+    const typeNames = getFilteredColumnValues("itemtypes", "ItemType", "Code", base);
+    if (typeNames.length > 0) {
+        return { content: base + "\n\n" + typeNames[0] + " (Item Type)" };
+    }
+
+    // Auto-TC with numeric level suffix (e.g. "weap3" → code "weap", level 3)
+    const concatMatch = /^([a-zA-Z]+)([1-9][0-9]*)$/.exec(base);
+    if (concatMatch) {
+        const autoTypeNames = getFilteredColumnValues("itemtypes", "ItemType", "Code", concatMatch[1]);
+        if (autoTypeNames.length > 0) {
+            return { content: base + "\n\n" + autoTypeNames[0] + " (Level " + concatMatch[2] + " TC)" };
+        }
+    }
+
+    return null;
+}
+
+// ─── gotoDefinition ───────────────────────────────────────────────────────────
+function gotoDefinition(ctx: GotoDefinitionContext) : GotoDefinitionTarget | null {
+    if (ctx.file !== "treasureclassex") return null;
+    if (!ctx.col.toLocaleLowerCase().startsWith("item")) return null;
+
+    if (lookupKey("weapons", "code", ctx.value))
+        return { targetFile: "weapons", targetCol: "code", targetValue: ctx.value };
+    if (lookupKey("armor", "code", ctx.value))
+        return { targetFile: "armor", targetCol: "code", targetValue: ctx.value };
+    if (lookupKey("misc", "code", ctx.value))
+        return { targetFile: "misc", targetCol: "code", targetValue: ctx.value };
+    if (lookupKey("uniqueitems", "index", ctx.value))
+        return { targetFile: "uniqueitems", targetCol: "index", targetValue: ctx.value };
+    if (lookupKey("setitems", "index", ctx.value))
+        return { targetFile: "setitems", targetCol: "index", targetValue: ctx.value };
+    if (lookupKey("treasureclassex", "treasure class", ctx.value))
+        return { targetFile: "treasureclassex", targetCol: "treasure class", targetValue: ctx.value };
+    
+    const autoTcCodes = new Set(
+        getFilteredColumnValues("itemtypes", "Code", "TreasureClass", "1")
+            .map((c: string) => c.toLowerCase())
+    );
+    const concatMatch = /^([a-z]+)([1-9][0-9]*)$/.exec(ctx.value.toLocaleLowerCase());
+    if (concatMatch && autoTcCodes.has(concatMatch[1])) {
+        return { targetFile: "itemtypes", targetCol: "Code", targetValue: concatMatch[1] };
+    }
+
+    return null;
 }

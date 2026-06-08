@@ -82,6 +82,7 @@ function checkItemCode(
 ): void {
     const val = row[col] as string;
     if (!val) return;
+    if (val === "0" || val === "xxx") return;
 
     const valid = lookupKey("weapons", "code", val)
                || lookupKey("armor",   "code", val)
@@ -96,4 +97,18 @@ function checkItemCode(
             message:  `'${val}' is not a valid item code (not found in weapons, armor, or misc)`,
         });
     }
+}
+
+function gotoDefinition(ctx: GotoDefinitionContext): GotoDefinitionTarget | null {
+    const fields = ITEM_CODE_FIELDS[ctx.file];
+    if (!fields) return null;
+
+    if (lookupKey("weapons", "code", ctx.value))
+        return { targetFile: "weapons", targetCol: "code", targetValue: ctx.value };
+    if (lookupKey("armor", "code", ctx.value))
+        return { targetFile: "armor", targetCol: "code", targetValue: ctx.value };
+    if (lookupKey("misc", "code", ctx.value))
+        return { targetFile: "misc", targetCol: "code", targetValue: ctx.value };
+
+    return null;
 }

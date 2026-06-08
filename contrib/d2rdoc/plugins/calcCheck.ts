@@ -93,6 +93,7 @@ const SCOPE_CALC_FILE: Record<string, string | null> = {
 const VALID_COND_NAMES: Record<string, boolean> = {
     IsType: true, IsClass: true, Desecrated: true, Difficulty: true,
     MonsterTestElite: true, ItemIsType: true, ItemIsModType: true, MonsterHasMod: true,
+    IsDesecratedZonesEnabled: true,
 };
 
 // Valid parameters for stat().

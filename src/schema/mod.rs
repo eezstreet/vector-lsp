@@ -129,10 +129,11 @@ pub struct SchemaFile {
 }
 
 impl SchemaFile {
-    /// Find a field by its primary name or any alt name.
+    /// Find a field by its primary name or any alt name (case-insensitive).
     pub fn find_field(&self, col_name: &str) -> Option<&SchemaField> {
+        let lower = col_name.to_lowercase();
         self.fields.iter().find(|f| {
-            f.name == col_name || f.alt_names.iter().any(|a| a == col_name)
+            f.name.to_lowercase() == lower || f.alt_names.iter().any(|a| a.to_lowercase() == lower)
         })
     }
 }

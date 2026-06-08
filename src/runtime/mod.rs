@@ -235,12 +235,29 @@ pub fn op_get_enum_table(
     #[string] file: &str,
     #[string] col: &str,
 ) -> Option<EnumTableResult> {
-    let schema = state.try_borrow::<Arc<Schema>>()?;
-    let field = schema.find_field(file, col)?;
-    let table = field.table.as_ref()?;
+    let debug = std::env::var("VLSP_DEBUG_LOGGING").is_ok();
+    let schema = state.try_borrow::<Arc<Schema>>();
+    if schema.is_none() {
+        if debug { eprintln!("[enum-debug] no schema in OpState for file={file} col={col}"); }
+        return None;
+    }
+    let schema = schema.unwrap();
+    let field = schema.find_field(file, col);
+    if field.is_none() {
+        if debug { eprintln!("[enum-debug] find_field returned None for file={file} col={col}"); }
+        return None;
+    }
+    let field = field.unwrap();
+    let table = field.table.as_ref();
+    if table.is_none() {
+        if debug { eprintln!("[enum-debug] field has no table for file={file} col={col}"); }
+        return None;
+    }
+    let table = table.unwrap();
     let header_row = table.first()?;
     let headers = header_row.iter().map(cell_raw).collect();
     let rows = table.iter().skip(1).map(|row| row.iter().map(cell_formatted).collect()).collect();
+    if debug { eprintln!("[enum-debug] returning table with {} rows for file={file} col={col}", table.len() - 1); }
     Some(EnumTableResult { headers, rows })
 }
 

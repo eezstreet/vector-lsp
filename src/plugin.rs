@@ -181,15 +181,35 @@ impl PluginHost {
                         rt.set_workspace_snapshot(snapshot);
                         let ctx_json = ctx.to_string();
                         // Call each hover function in turn; return the first non-null result.
-                        let expr = format!(
-                            "(function(ctx){{\
-                                for(var i=0;i<__hovers.length;i++){{\
-                                    try{{var r=__hovers[i](ctx);if(r!=null)return r;}}catch(e){{}}\
-                                }}\
-                                return null;\
-                            }})({ctx_json})"
-                        );
-                        let result = rt.eval_json(&expr).ok().and_then(|v| match v {
+                        let debug = std::env::var("VLSP_DEBUG_LOGGING").is_ok();
+                        if debug {
+                            eprintln!("[hover-debug] ctx={ctx_json}");
+                            let len = rt.eval_json("__hovers.length").ok().and_then(|v| v.as_u64()).unwrap_or(0);
+                            eprintln!("[hover-debug] __hovers.length={len}");
+                        }
+                        let expr = if debug {
+                            format!(
+                                "(function(ctx){{\
+                                    for(var i=0;i<__hovers.length;i++){{\
+                                        try{{var r=__hovers[i](ctx);if(r!=null)return r;}}\
+                                        catch(e){{Deno.core.print('[hover-err-'+i+'] '+String(e)+'\\n',true);}}\
+                                    }}\
+                                    return null;\
+                                }})({ctx_json})"
+                            )
+                        } else {
+                            format!(
+                                "(function(ctx){{\
+                                    for(var i=0;i<__hovers.length;i++){{\
+                                        try{{var r=__hovers[i](ctx);if(r!=null)return r;}}catch(e){{}}\
+                                    }}\
+                                    return null;\
+                                }})({ctx_json})"
+                            )
+                        };
+                        let raw = rt.eval_json(&expr);
+                        if debug { eprintln!("[hover-debug] raw={raw:?}"); }
+                        let result = raw.ok().and_then(|v| match v {
                             Value::Null => None,
                             // Plugin returned { content: "..." }
                             Value::Object(_) => serde_json::from_value::<RawHover>(v)
@@ -199,6 +219,7 @@ impl PluginHost {
                             Value::String(s) => Some(s),
                             _ => None,
                         });
+                        if debug { eprintln!("[hover-debug] result={result:?}"); }
                         let _ = reply.send(result);
                     }
                     PluginRequest::GotoDefinition { ctx, index, snapshot, reply } => {
@@ -456,6 +477,12 @@ fn strip_ts_inline(src: &str) -> String {
     // Per-paren-depth ternary tracking: entry k is true if a `?` was seen at
     // paren depth k without a matching `:` yet.
     let mut ternary: Vec<bool> = vec![false]; // index 0 = global scope
+    // Track parens opened since the most recent `{`. Resets to 0 when a `{`
+    // opens (saved on a stack) and restores when `}` closes.  When this is > 0
+    // we are in a function-param / arrow-param context above the current brace
+    // level, so `:` annotations should be stripped even at deep brace nesting.
+    let mut paren_above_brace: usize = 0;
+    let mut brace_paren_stack: Vec<usize> = Vec::new();
 
     while i < n {
         let ch = chars[i];
@@ -484,18 +511,23 @@ fn strip_ts_inline(src: &str) -> String {
 
         // ---- Depth bookkeeping ----------------------------------------------
         if ch == '{' {
+            brace_paren_stack.push(paren_above_brace);
+            paren_above_brace = 0;
             brace_depth += 1;
             out.push(ch); i += 1; continue;
         }
         if ch == '}' && brace_depth > 0 {
             brace_depth -= 1;
+            paren_above_brace = brace_paren_stack.pop().unwrap_or(0);
             out.push(ch); i += 1; continue;
         }
         if ch == '(' {
+            paren_above_brace += 1;
             ternary.push(false);
             out.push(ch); i += 1; continue;
         }
         if ch == ')' {
+            if paren_above_brace > 0 { paren_above_brace -= 1; }
             if ternary.len() > 1 { ternary.pop(); }
             out.push(ch); i += 1; continue;
         }
@@ -529,11 +561,11 @@ fn strip_ts_inline(src: &str) -> String {
                 out.push(ch); i += 1; continue;
             }
 
-            let paren_depth = ternary.len().saturating_sub(1);
-            // Strip only when we're at the top level OR inside more parens than
-            // braces — the latter captures function-param contexts inside method
-            // bodies while correctly leaving object-literal `{key: val}` alone.
-            let depth_ok = brace_depth == 0 || paren_depth > brace_depth;
+            // Strip only when we're at the top level OR inside at least one paren
+            // opened since the last `{` — the latter captures function-param and
+            // arrow-param contexts at any brace depth while leaving object-literal
+            // `{key: val}` alone (paren_above_brace resets to 0 on each `{`).
+            let depth_ok = brace_depth == 0 || paren_above_brace > 0;
             // Use the OUTPUT for the previous-char check so that stripped tokens
             // (e.g. the `?` in `x?:`) don't confuse the context detection.
             let prev_out = out.chars().rev().find(|c| !matches!(*c, ' ' | '\t' | '\n' | '\r'));
@@ -976,5 +1008,21 @@ function validate(ctx: PluginContext): string[] {
         assert!(out.contains("n > 0 ? \"ok\" : \"empty\""), "ternary preserved, got: {out}");
         // Arrow param inside forEach should be stripped
         assert!(out.contains("(row)"), "arrow param stripped, got: {out}");
+    }
+
+    #[test]
+    fn strips_arrow_param_type_deep_nested() {
+        // Arrow param types must be stripped even when paren_depth == brace_depth
+        // (e.g. inside two if-blocks, inside .map((s: string) => ...))
+        let out = strip_typescript(
+            "function f() {\
+                if (a) {\
+                    x.map((s: string) => s.trim())\
+                     .filter((s: string) => s.length > 0);\
+                }\
+            }",
+        );
+        assert!(out.contains("(s)"), "arrow param type stripped in deep nest, got: {out}");
+        assert!(!out.contains(": string"), "no type annotation left, got: {out}");
     }
 }

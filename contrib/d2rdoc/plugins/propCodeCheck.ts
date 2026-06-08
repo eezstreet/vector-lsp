@@ -70,3 +70,15 @@ function checkPropCode(
         });
     }
 }
+
+function gotoDefinition(ctx: GotoDefinitionContext): GotoDefinitionTarget | null {
+    const fields = PROP_CODE_FIELDS[ctx.file];
+    if (!fields) return null;
+
+    if (lookupKey("properties", "code", ctx.value))
+        return { targetFile: "properties", targetCol: "code", targetValue: ctx.value };
+    if (lookupKey("propertygroups", "code", ctx.value))
+        return { targetFile: "propertygroups", targetCol: "code", targetValue: ctx.value };
+
+    return null;
+}
