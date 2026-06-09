@@ -195,45 +195,126 @@ function validateItem(
     return `'${base}' is not a valid item code, treasure class, auto-TC, unique index, or set item index`;
 }
 
-// ─── hover ─────────────────────────────────────────────────────────────────
-function hover(ctx: HoverContext): HoverResult | null {
-    if (!ctx.value) return null;
-    if (ctx.file !== "treasureclassex") return null;
-    if (!ctx.col.toLocaleLowerCase().startsWith("item")) return null;
+// ─── hover helpers ──────────────────────────────────────────────────────────
 
-    // Strip outer quotes and modifiers to isolate the base token.
-    let raw = ctx.value.trim();
-    if (raw.startsWith('"') && raw.endsWith('"')) {
-        raw = raw.slice(1, -1).trim();
-    }
-    const [base] = splitModifiers(raw);
-    if (!base) return null;
+// Case-insensitive row value lookup. ctx.row keys come from raw file headers
+// whose casing may differ from what we construct (e.g. "Item1" vs "item1").
+function rowGet(row: Record<string, string>, key: string): string {
+    const lower = key.toLowerCase();
+    const found = Object.keys(row).find(function(k) { return k.toLowerCase() === lower; });
+    return found ? (row[found] || "") : "";
+}
 
-    // Item code (weapons / armor / misc)
+// Resolve an item base token to "token\n\nHuman Name" if a name is found in
+// the workspace, or null if the token is an unrecognised TC/unique/set reference.
+function resolveItemName(base: string): string | null {
     const names = getFilteredColumnValues("weapons", "name", "code", base).concat(
-        getFilteredColumnValues("armor", "name", "code", base),
-        getFilteredColumnValues("misc",  "name", "code", base)
+        getFilteredColumnValues("armor",   "name", "code", base),
+        getFilteredColumnValues("misc",    "name", "code", base),
     );
-    if (names.length > 0) {
-        return { content: base + "\n\n" + names[0] };
-    }
+    if (names.length > 0) return base + "\n\n" + names[0];
 
-    // Item type (exact Code match, e.g. "weap", "armo")
     const typeNames = getFilteredColumnValues("itemtypes", "ItemType", "Code", base);
-    if (typeNames.length > 0) {
-        return { content: base + "\n\n" + typeNames[0] + " (Item Type)" };
-    }
+    if (typeNames.length > 0) return base + "\n\n" + typeNames[0] + " (Item Type)";
 
-    // Auto-TC with numeric level suffix (e.g. "weap3" → code "weap", level 3)
     const concatMatch = /^([a-zA-Z]+)([1-9][0-9]*)$/.exec(base);
     if (concatMatch) {
         const autoTypeNames = getFilteredColumnValues("itemtypes", "ItemType", "Code", concatMatch[1]);
         if (autoTypeNames.length > 0) {
-            return { content: base + "\n\n" + autoTypeNames[0] + " (Level " + concatMatch[2] + " TC)" };
+            return base + "\n\n" + autoTypeNames[0] + " (Level " + concatMatch[2] + " TC)";
         }
     }
 
     return null;
+}
+
+// ─── hover ──────────────────────────────────────────────────────────────────
+// Handles both Item# and Prob# columns in TreasureClassEx.txt.
+//
+// Item# — shows the resolved item name plus the per-slot drop chance.
+// Prob# — shows the paired Item#'s resolved name plus the drop chance.
+//
+// Chance formula (only when Picks > 0):
+//   total        = NoDrop + Prob1 + … + Prob10
+//   per_roll     = ProbX / total
+//   at_least_one = 1 − (1 − per_roll)^Picks   (shown only when Picks > 1)
+function hover(ctx: HoverContext): HoverResult | null {
+    if (ctx.file !== "treasureclassex") return null;
+
+    const colLower = ctx.col.toLowerCase();
+    const itemMatch = /^item(\d+)$/.exec(colLower);
+    const probMatch = /^prob(\d+)$/.exec(colLower);
+    if (!itemMatch && !probMatch) return null;
+
+    const idx = (itemMatch ?? probMatch)[1];
+
+    // Locate the raw item token for this slot.
+    // ItemX: the hovered cell itself.  ProbX: the paired Item{idx} cell.
+    // rowGet is used for cross-column lookups to tolerate header casing differences.
+    let rawItem = itemMatch
+        ? (ctx.value || "").trim()
+        : rowGet(ctx.row, "Item" + idx).trim();
+    if (rawItem.startsWith('"') && rawItem.endsWith('"')) {
+        rawItem = rawItem.slice(1, -1).trim();
+    }
+    const [base] = splitModifiers(rawItem);
+    if (!base) return null;
+
+    // Attempt to resolve the token to a human-readable name.
+    // Fall back to the raw token so chance info always has a header.
+    const nameContent = resolveItemName(base) ?? base;
+
+    // ── Chance calculation ─────────────────────────────────────────────────
+    let chanceContent: string | null = null;
+
+    const picksRaw = rowGet(ctx.row, "Picks");
+    const picks = picksRaw.trim() ? parseInt(picksRaw.trim(), 10) : 1;
+
+    if (!isNaN(picks) && picks > 0) {
+        const probRaw = probMatch
+            ? (ctx.value || "").trim()
+            : rowGet(ctx.row, "Prob" + idx).trim();
+        const probVal = parseInt(probRaw, 10);
+
+        if (!isNaN(probVal) && probVal > 0) {
+            let total = 0;
+            for (let i = 1; ; i++) {
+                if (!getColumn("treasureclassex", "Prob" + i)) break;
+                const v = rowGet(ctx.row, "Prob" + i);
+                if (v && v.trim()) {
+                    const p = parseInt(v.trim(), 10);
+                    if (!isNaN(p)) total += p;
+                }
+            }
+            const noDropRaw = rowGet(ctx.row, "NoDrop");
+            if (noDropRaw.trim()) {
+                const nd = parseInt(noDropRaw.trim(), 10);
+                if (!isNaN(nd)) total += nd;
+            }
+
+            if (total > 0) {
+                const perRoll = probVal / total;
+                const atLeastOnce = 1 - Math.pow(1 - perRoll, picks);
+
+                const fmt = (x: number) => {
+                    let s = (x * 100).toFixed(4);
+                    s = s.replace(/\.?0+$/, "");
+                    return s + "%";
+                };
+
+                if (picks > 1) {
+                    chanceContent = "Per-roll chance: " + fmt(perRoll) + " (" + probVal + " / " + total + ")"
+                        + "\nAt least once in " + picks + " picks: **" + fmt(atLeastOnce) + "**";
+                } else {
+                    chanceContent = "Chance: **" + fmt(perRoll) + "** (" + probVal + " / " + total + ")";
+                }
+            }
+        }
+    }
+
+    const parts: string[] = [nameContent];
+    if (chanceContent) { parts.push(""); parts.push(chanceContent); }
+    return { content: parts.join("\n") };
 }
 
 // ─── gotoDefinition ───────────────────────────────────────────────────────────

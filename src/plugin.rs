@@ -561,14 +561,13 @@ fn strip_ts_inline(src: &str) -> String {
                 out.push(ch); i += 1; continue;
             }
 
-            // Strip only when we're at the top level OR inside at least one paren
-            // opened since the last `{` — the latter captures function-param and
-            // arrow-param contexts at any brace depth while leaving object-literal
-            // `{key: val}` alone (paren_above_brace resets to 0 on each `{`).
-            let depth_ok = brace_depth == 0 || paren_above_brace > 0;
             // Use the OUTPUT for the previous-char check so that stripped tokens
             // (e.g. the `?` in `x?:`) don't confuse the context detection.
             let prev_out = out.chars().rev().find(|c| !matches!(*c, ' ' | '\t' | '\n' | '\r'));
+            // Strip when at top level, inside parens opened since the last `{`
+            // (function/arrow params), or immediately after `)` (return-type
+            // annotation — `): Type` is never a valid JS object-literal colon).
+            let depth_ok = brace_depth == 0 || paren_above_brace > 0 || prev_out == Some(')');
             let prev_ok = prev_out.map_or(false, |c| is_id(c) || matches!(c, ')' | ']' | '>'));
             // What follows `:` must look like a type start
             let next_ok = chars[i + 1..]
@@ -1008,6 +1007,16 @@ function validate(ctx: PluginContext): string[] {
         assert!(out.contains("n > 0 ? \"ok\" : \"empty\""), "ternary preserved, got: {out}");
         // Arrow param inside forEach should be stripped
         assert!(out.contains("(row)"), "arrow param stripped, got: {out}");
+    }
+
+    #[test]
+    fn strips_arrow_return_type_inside_function_body() {
+        // `): ReturnType =>` inside a function body — depth_ok was false before the fix
+        let out = strip_typescript(
+            "function hover(ctx: Ctx): HoverResult | null {\n    const fmt = (x: number): string => { return x.toFixed(2); };\n    return null;\n}",
+        );
+        assert!(out.contains("const fmt = (x)"), "arrow return type stripped, got: {out}");
+        assert!(!out.contains(": string"), "no type annotation left, got: {out}");
     }
 
     #[test]
