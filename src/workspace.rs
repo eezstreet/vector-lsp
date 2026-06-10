@@ -14,6 +14,7 @@ use crate::schema::Schema;
 ///
 /// Only columns that are `reference` targets in the schema are stored, keeping
 /// memory usage proportional to what go-to-definition actually needs.
+#[derive(Clone)]
 pub struct SymbolIndex {
     entries: HashMap<(String, String, String), Location>,
 }

@@ -165,6 +165,20 @@ pub fn op_has_file(state: &OpState, #[string] stem: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Newtype wrapper so `CtxJson` has a unique type key in `OpState`.
+pub struct CtxJson(pub String);
+
+/// Return the current validation context JSON string.
+/// Called from JS as `Deno.core.ops.op_get_ctx_json()` so plugins receive their
+/// context via `JSON.parse(...)` rather than as an inline JS object literal —
+/// V8's JSON parser is faster than its object-literal parser for large payloads,
+/// and this avoids a large `format!` allocation on the Rust side.
+#[op2]
+#[string]
+pub fn op_get_ctx_json(state: &OpState) -> String {
+    state.try_borrow::<CtxJson>().map(|c| c.0.clone()).unwrap_or_default()
+}
+
 /// Return all non-empty values in column `col` of file `stem`.
 /// Callable from JS as `Deno.core.ops.op_get_column_values(stem, col)`.
 #[op2]
@@ -313,6 +327,7 @@ extension!(
         op_get_column_values,
         op_get_filtered_column_values,
         op_get_enum_table,
+        op_get_ctx_json,
     ],
 );
 
@@ -349,6 +364,12 @@ impl ScriptRuntime {
     /// up-to-date data.
     pub fn set_workspace_index(&mut self, index: Arc<WorkspaceIndex>) {
         self.inner.op_state().borrow_mut().put(index);
+    }
+
+    /// Store the current file's context JSON so the `op_get_ctx_json` op can
+    /// return it to JS without requiring a large `format!` embedding.
+    pub fn set_ctx_json(&mut self, json: String) {
+        self.inner.op_state().borrow_mut().put(CtxJson(json));
     }
 
     /// Replace the per-file workspace snapshot stored in `OpState`.

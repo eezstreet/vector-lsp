@@ -123,7 +123,7 @@ impl Backend {
             .log_message(MessageType::INFO, format!("Indexed {count} workspace files."))
             .await;
 
-        // Build workspace snapshot + index once; per-file calls share them via Arc (O(1) clone).
+        // Build workspace snapshot + index once for plugins; shared via Arc.
         let t_snapshot_start = Instant::now();
         let shared = if self.plugin_host.is_some() {
             let ws = self.workspace.read().await;
@@ -135,34 +135,65 @@ impl Backend {
         };
         let t_snapshot = t_snapshot_start.elapsed();
 
-        // Validate all files and collect diagnostics. Validation is synchronous CPU work
-        // so we hold the read lock only during each file's check, no awaits inside.
-        let mut schema_total = std::time::Duration::ZERO;
+        // Snapshot schema + symbol index once under a single read lock, then release it.
+        // Cloning SymbolIndex (one HashMap copy) lets all spawn_blocking tasks validate
+        // in parallel without any of them holding the workspace lock.
+        let (schema_arc, symbols_arc, file_pairs) = {
+            let ws = self.workspace.read().await;
+            let schema = ws.schema.clone();
+            let symbols = Arc::new(ws.symbols.clone());
+            let pairs: Vec<(Url, String, Option<Arc<DocumentData>>)> = uri_stems
+                .iter()
+                .map(|(uri, stem)| {
+                    let doc = uri
+                        .to_file_path()
+                        .ok()
+                        .and_then(|p| ws.file_cache.get(&p))
+                        .cloned();
+                    (uri.clone(), stem.clone(), doc)
+                })
+                .collect();
+            (schema, symbols, pairs)
+        };
+
+        // Validate all files in parallel on the blocking thread pool.
+        let t_schema_start = Instant::now();
+        let mut diag_set: tokio::task::JoinSet<(
+            Url,
+            String,
+            Option<Arc<DocumentData>>,
+            Vec<Diagnostic>,
+        )> = tokio::task::JoinSet::new();
+        for (uri, stem, doc) in file_pairs {
+            let schema = schema_arc.clone();
+            let symbols = Arc::clone(&symbols_arc);
+            diag_set.spawn_blocking(move || {
+                let diags = doc
+                    .as_ref()
+                    .map(|d| diagnostics::validate_document(&stem, d, schema.as_deref(), &*symbols))
+                    .unwrap_or_default();
+                (uri, stem, doc, diags)
+            });
+        }
+        let mut schema_results: Vec<(Url, String, Option<Arc<DocumentData>>, Vec<Diagnostic>)> =
+            Vec::new();
+        while let Some(result) = diag_set.join_next().await {
+            if let Ok(item) = result {
+                schema_results.push(item);
+            }
+        }
+        let schema_total = t_schema_start.elapsed();
+
+        // Plugin diagnostics are async and must remain sequential.
         let mut plugin_total = std::time::Duration::ZERO;
-        let mut pending_publish: Vec<(Url, Vec<tower_lsp::lsp_types::Diagnostic>)> = Vec::new();
-        for (uri, stem) in uri_stems {
-            let (schema_diags, plugin_data) = {
-                let ws = self.workspace.read().await;
-                let path = uri.to_file_path().ok();
-                match path.as_ref().and_then(|p| ws.file_cache.get(p)) {
-                    Some(doc) => {
-                        let t = Instant::now();
-                        let schema_diags = diagnostics::validate_document(
-                            &stem, doc, ws.schema.as_deref(), &ws.symbols,
-                        );
-                        schema_total += t.elapsed();
-                        let plugin_data = shared.as_ref().map(|(snap, idx)| {
-                            let ctx = plugin::build_context(&stem, doc);
-                            (ctx, idx.clone(), snap.clone())
-                        });
-                        (schema_diags, plugin_data)
-                    }
-                    None => (vec![], None),
-                }
-            };
+        let mut pending_publish: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
+        for (uri, stem, doc, schema_diags) in schema_results {
             let t = Instant::now();
-            let plugin_diags = match (plugin_data, &self.plugin_host) {
-                (Some((ctx, idx, snap)), Some(ph)) => ph.run(ctx, idx, snap).await,
+            let plugin_diags = match (&shared, doc.as_ref(), &self.plugin_host) {
+                (Some((snap, idx)), Some(d), Some(ph)) => {
+                    let ctx = plugin::build_context(&stem, d);
+                    ph.run(ctx, idx.clone(), snap.clone()).await
+                }
                 _ => vec![],
             };
             plugin_total += t.elapsed();
@@ -188,7 +219,7 @@ impl Backend {
                 MessageType::LOG,
                 format!(
                     "vlsp perf [{count} files]: snapshot={t_snapshot:.0?} \
-                     schema={schema_total:.0?} plugins={plugin_total:.0?} total={total:.0?}"
+                     schema={schema_total:.0?}(parallel) plugins={plugin_total:.0?} total={total:.0?}"
                 ),
             )
             .await;

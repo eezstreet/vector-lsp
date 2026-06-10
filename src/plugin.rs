@@ -81,7 +81,7 @@ enum PluginRequest {
         schema: Arc<Schema>,
     },
     Validate {
-        ctx: Value,
+        ctx: String,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
         reply: oneshot::Sender<Vec<Diagnostic>>,
@@ -126,20 +126,32 @@ impl PluginHost {
                 "__seed__",
                 "var __plugins = []; var __hovers = []; var __gotos = [];\
                  var validate; var hover; var gotoDefinition;\
+                 var __lookupCache={};\
+                 var __colCache={};\
+                 var __cvCache={};\
+                 var __filteredCvCache={};\
                  function lookupKey(file,col,value){\
-                     return Deno.core.ops.op_lookup_key(file,col,value);\
+                     var k=file+'|'+col+'|'+value;\
+                     if(!(k in __lookupCache)){__lookupCache[k]=Deno.core.ops.op_lookup_key(file,col,value);}\
+                     return __lookupCache[k];\
                  }\
                  function getColumn(file,col){\
-                     return Deno.core.ops.op_get_column(file,col)||undefined;\
+                     var k=file+'|'+col;\
+                     if(!(k in __colCache)){__colCache[k]=Deno.core.ops.op_get_column(file,col)||undefined;}\
+                     return __colCache[k];\
                  }\
                  function hasFile(stem){\
                      return Deno.core.ops.op_has_file(stem);\
                  }\
                  function getColumnValues(stem,col){\
-                     return Deno.core.ops.op_get_column_values(stem,col);\
+                     var k=stem+'|'+col;\
+                     if(!(k in __cvCache)){__cvCache[k]=Deno.core.ops.op_get_column_values(stem,col);}\
+                     return __cvCache[k];\
                  }\
                  function getFilteredColumnValues(stem,valueCol,filterCol,filterValue){\
-                     return Deno.core.ops.op_get_filtered_column_values(stem,valueCol,filterCol,filterValue);\
+                     var k=stem+'|'+valueCol+'|'+filterCol+'|'+filterValue;\
+                     if(!(k in __filteredCvCache)){__filteredCvCache[k]=Deno.core.ops.op_get_filtered_column_values(stem,valueCol,filterCol,filterValue);}\
+                     return __filteredCvCache[k];\
                  }\
                  function getEnumTable(file,col){\
                      return Deno.core.ops.op_get_enum_table(file,col)||null;\
@@ -152,22 +164,31 @@ impl PluginHost {
                 }
             }
 
+            // Tracks the last snapshot seen so the column-value cache can be
+            // invalidated exactly when the workspace data changes.
+            let mut last_snapshot_ptr: usize = 0;
+
             while let Some(req) = rx.blocking_recv() {
                 match req {
                     PluginRequest::SetSchema { schema } => {
                         rt.set_schema(schema);
                     }
                     PluginRequest::Validate { ctx, index, snapshot, reply } => {
+                        let ptr = Arc::as_ptr(&snapshot) as usize;
+                        if ptr != last_snapshot_ptr {
+                            let _ = rt.exec("__cache_reset__", "var __lookupCache={}; var __colCache={}; var __cvCache={}; var __filteredCvCache={};");
+                            last_snapshot_ptr = ptr;
+                        }
                         rt.set_workspace_index(index);
                         rt.set_workspace_snapshot(snapshot);
-                        let ctx_json = ctx.to_string();
-                        let expr = format!(
-                            "__plugins.flatMap(function(fn){{\
-                                try{{return fn({ctx_json})||[];}}catch(e){{return [];}}\
-                            }})"
-                        );
+                        rt.set_ctx_json(ctx);
                         let diags = rt
-                            .eval_json(&expr)
+                            .eval_json(
+                                "var __c__=JSON.parse(Deno.core.ops.op_get_ctx_json());\
+                                 __plugins.flatMap(function(fn){\
+                                     try{return fn(__c__)||[];}catch(e){return []}\
+                                 })",
+                            )
                             .ok()
                             .and_then(|v| serde_json::from_value::<Vec<RawDiag>>(v).ok())
                             .into_iter()
@@ -261,7 +282,7 @@ impl PluginHost {
     /// Run all `validate` plugin functions and return any diagnostics.
     pub async fn run(
         &self,
-        ctx: Value,
+        ctx: String,
         index: Arc<WorkspaceIndex>,
         snapshot: Arc<WorkspaceFileSnapshot>,
     ) -> Vec<Diagnostic> {
@@ -327,23 +348,77 @@ fn load_plugin(rt: &mut ScriptRuntime, path: &Path) -> anyhow::Result<()> {
 // Context construction
 // ---------------------------------------------------------------------------
 
-/// Build the context object passed to plugin `validate` functions.
+/// Build the JSON context string passed to plugin `validate` functions.
 ///
-/// Shape:
-/// ```json
-/// {
-///   "file": "cubemain",
-///   "headers": ["enabled", ...],
-///   "rows": [{ "__line": 1, "__colstarts": { "enabled": 0 }, "enabled": "1", ... }]
-/// }
-/// ```
-/// Workspace data is NOT included here; plugins access it via `getWorkspaceFile(stem)`.
-pub fn build_context(file_stem: &str, doc: &DocumentData) -> Value {
-    json!({
-        "file": file_stem,
-        "headers": doc.headers,
-        "rows": rows_to_json(doc),
-    })
+/// Shape: `{"file":"cubemain","headers":[...],"rows":[{"__line":1,"__colstarts":{...},...}]}`
+///
+/// Serialised directly to a `String` to avoid constructing an intermediate
+/// `serde_json::Value` tree and then re-serialising it — for a 20k-row document
+/// that would otherwise allocate millions of temporary strings.
+pub fn build_context(file_stem: &str, doc: &DocumentData) -> String {
+    let col_count = doc.headers.len();
+    let row_count = doc.rows.len();
+    // Rough capacity estimate: ~100 bytes overhead + ~60 bytes per (row × col).
+    let capacity = 128 + row_count * col_count * 60;
+    let mut s = String::with_capacity(capacity);
+
+    s.push_str("{\"file\":");
+    push_json_str(&mut s, file_stem);
+    s.push_str(",\"headers\":[");
+    for (i, h) in doc.headers.iter().enumerate() {
+        if i > 0 { s.push(','); }
+        push_json_str(&mut s, h);
+    }
+    s.push_str("],\"rows\":[");
+    for (ri, row) in doc.rows.iter().enumerate() {
+        if ri > 0 { s.push(','); }
+        s.push_str("{\"__line\":");
+        s.push_str(&row.line.to_string());
+        s.push_str(",\"__colstarts\":{");
+        let mut first_cs = true;
+        for (i, cell) in row.cells.iter().enumerate() {
+            if let Some(h) = doc.headers.get(i) {
+                if !h.is_empty() {
+                    if !first_cs { s.push(','); }
+                    first_cs = false;
+                    push_json_str(&mut s, h);
+                    s.push(':');
+                    s.push_str(&cell.col_start.to_string());
+                }
+            }
+        }
+        s.push('}');
+        for (i, cell) in row.cells.iter().enumerate() {
+            if let Some(h) = doc.headers.get(i) {
+                if !h.is_empty() {
+                    s.push(',');
+                    push_json_str(&mut s, h);
+                    s.push(':');
+                    push_json_str(&mut s, &cell.value);
+                }
+            }
+        }
+        s.push('}');
+    }
+    s.push_str("]}");
+    s
+}
+
+/// Append a JSON-escaped string literal (with surrounding quotes) to `buf`.
+fn push_json_str(buf: &mut String, v: &str) {
+    buf.push('"');
+    for ch in v.chars() {
+        match ch {
+            '"'  => buf.push_str("\\\""),
+            '\\' => buf.push_str("\\\\"),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\t' => buf.push_str("\\t"),
+            c if (c as u32) < 0x20 => { use std::fmt::Write; let _ = write!(buf, "\\u{:04x}", c as u32); }
+            c    => buf.push(c),
+        }
+    }
+    buf.push('"');
 }
 
 /// Build the context object passed to plugin `hover` functions.
@@ -424,26 +499,6 @@ pub fn build_workspace_snapshot(
     Arc::new(snap)
 }
 
-fn rows_to_json(doc: &DocumentData) -> Vec<Value> {
-    doc.rows
-        .iter()
-        .map(|row| {
-            let mut obj = serde_json::Map::new();
-            obj.insert("__line".into(), json!(row.line));
-            let mut colstarts = serde_json::Map::new();
-            for (i, cell) in row.cells.iter().enumerate() {
-                if let Some(h) = doc.headers.get(i) {
-                    if !h.is_empty() {
-                        obj.insert(h.clone(), json!(cell.value));
-                        colstarts.insert(h.clone(), json!(cell.col_start));
-                    }
-                }
-            }
-            obj.insert("__colstarts".into(), Value::Object(colstarts));
-            Value::Object(obj)
-        })
-        .collect()
-}
 
 // ---------------------------------------------------------------------------
 // TypeScript preprocessor
