@@ -62,8 +62,8 @@ impl Backend {
             }
         };
 
-        // Collect parsed documents without holding the workspace lock.
-        let mut parsed: Vec<(Url, std::path::PathBuf, String, Arc<DocumentData>)> = Vec::new();
+        // Collect directory entries before spawning so we can log errors on the main task.
+        let mut entries: Vec<(Url, std::path::PathBuf, String)> = Vec::new();
         while let Ok(Some(entry)) = read_dir.next_entry().await {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some(ext.as_str()) {
@@ -71,16 +71,34 @@ impl Backend {
             }
             let Ok(uri) = Url::from_file_path(&path) else { continue };
             let stem = Self::file_stem(&uri);
-            match self.read_file(&path).await {
-                Ok(src) => parsed.push((uri, path, stem, Arc::new(DocumentData::parse(&src, delimiter)))),
-                Err(e) => {
-                    self.client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!("Skipping {}: {e}", path.display()),
-                        )
-                        .await;
-                }
+            entries.push((uri, path, stem));
+        }
+
+        // Read and parse all files in parallel. Each file gets its own task so I/O
+        // and CPU-intensive parsing don't serialize behind each other.
+        let settings = Arc::clone(&self.settings);
+        let mut join_set: tokio::task::JoinSet<
+            Option<(Url, std::path::PathBuf, String, Arc<DocumentData>)>,
+        > = tokio::task::JoinSet::new();
+        for (uri, path, stem) in entries {
+            let settings = Arc::clone(&settings);
+            join_set.spawn(async move {
+                let bytes = tokio::fs::read(&path).await.ok()?;
+                let src = settings.encoding.decode(&bytes).ok()?;
+                // Parse is synchronous and CPU-intensive; run it off the async executor.
+                let doc = tokio::task::spawn_blocking(move || {
+                    Arc::new(DocumentData::parse(&src, delimiter))
+                })
+                .await
+                .ok()?;
+                Some((uri, path, stem, doc))
+            });
+        }
+
+        let mut parsed: Vec<(Url, std::path::PathBuf, String, Arc<DocumentData>)> = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            if let Ok(Some(item)) = result {
+                parsed.push(item);
             }
         }
 
@@ -117,9 +135,11 @@ impl Backend {
         };
         let t_snapshot = t_snapshot_start.elapsed();
 
-        // Publish diagnostics now that the full symbol index is built.
+        // Validate all files and collect diagnostics. Validation is synchronous CPU work
+        // so we hold the read lock only during each file's check, no awaits inside.
         let mut schema_total = std::time::Duration::ZERO;
         let mut plugin_total = std::time::Duration::ZERO;
+        let mut pending_publish: Vec<(Url, Vec<tower_lsp::lsp_types::Diagnostic>)> = Vec::new();
         for (uri, stem) in uri_stems {
             let (schema_diags, plugin_data) = {
                 let ws = self.workspace.read().await;
@@ -148,8 +168,19 @@ impl Backend {
             plugin_total += t.elapsed();
             let mut diags = schema_diags;
             diags.extend(plugin_diags);
-            self.client.publish_diagnostics(uri, diags, None).await;
+            pending_publish.push((uri, diags));
         }
+
+        // Publish all diagnostics concurrently so they arrive at the client in a
+        // burst rather than trickling in one sequential await at a time.
+        let mut publish_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        for (uri, diags) in pending_publish {
+            let client = self.client.clone();
+            publish_set.spawn(async move {
+                client.publish_diagnostics(uri, diags, None).await;
+            });
+        }
+        while publish_set.join_next().await.is_some() {}
 
         let total = t_index.elapsed();
         self.client
