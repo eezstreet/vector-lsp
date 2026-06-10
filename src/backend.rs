@@ -164,6 +164,54 @@ impl Backend {
     }
 }
 
+/// Rebuild TSV text from a parsed document. Used to seed incremental change application.
+fn reconstruct_text(doc: &DocumentData, delimiter: char) -> String {
+    let delim_str = delimiter.to_string();
+    let header = doc.headers.join(&delim_str);
+    let rows: Vec<String> = doc
+        .rows
+        .iter()
+        .map(|row| row.cells.iter().map(|c| c.value.as_str()).collect::<Vec<_>>().join(&delim_str))
+        .collect();
+    std::iter::once(header).chain(rows).collect::<Vec<_>>().join("\n")
+}
+
+/// Apply a single LSP incremental content change to a lines buffer.
+fn apply_change(lines: &mut Vec<String>, range: tower_lsp::lsp_types::Range, new_text: &str) {
+    let sl = range.start.line as usize;
+    let sc = range.start.character as usize;
+    let el = range.end.line as usize;
+    let ec = range.end.character as usize;
+
+    let prefix: String = lines
+        .get(sl)
+        .map(|l| l.chars().take(sc).collect())
+        .unwrap_or_default();
+    let suffix: String = lines
+        .get(el)
+        .map(|l| l.chars().skip(ec.min(l.chars().count())).collect())
+        .unwrap_or_default();
+
+    let new_lines: Vec<&str> = new_text.split('\n').collect();
+    let replacement: Vec<String> = match new_lines.as_slice() {
+        [] | [""] => vec![format!("{prefix}{suffix}")],
+        [only] => vec![format!("{prefix}{}{suffix}", only.trim_end_matches('\r'))],
+        [first, rest @ ..] => {
+            let mut v = vec![format!("{prefix}{}", first.trim_end_matches('\r'))];
+            for mid in &rest[..rest.len() - 1] {
+                v.push(mid.trim_end_matches('\r').to_string());
+            }
+            v.push(format!("{}{suffix}", rest.last().unwrap().trim_end_matches('\r')));
+            v
+        }
+    };
+
+    while lines.len() <= el {
+        lines.push(String::new());
+    }
+    lines.splice(sl..=el, replacement);
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
@@ -183,7 +231,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
                         ..Default::default()
                     },
                 )),
@@ -287,37 +335,55 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        if let Some(change) = params.content_changes.last() {
-            let uri = params.text_document.uri;
-            let doc = Arc::new(DocumentData::parse(&change.text, self.settings.delimiter_char()));
-            let stem = Self::file_stem(&uri);
+        let uri = params.text_document.uri.clone();
+        let delimiter = self.settings.delimiter_char();
+        let stem = Self::file_stem(&uri);
 
-            let (schema_diags, plugin_data) = {
-                let mut ws = self.workspace.write().await;
-                let ref_targets = ws.ref_targets.clone();
-                ws.symbols.remove_file(&stem);
-                ws.symbols.index_document(&uri, &stem, &doc, &ref_targets);
-                let schema_diags = diagnostics::validate_document(
-                    &stem, &doc, ws.schema.as_deref(), &ws.symbols,
-                );
-                ws.open_documents.insert(uri.clone(), Arc::clone(&doc));
-                let plugin_data = self.plugin_host.as_ref().map(|_| {
-                    let ctx = plugin::build_context(&stem, &doc);
-                    let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
-                    let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
-                    (ctx, idx, snap)
-                });
-                (schema_diags, plugin_data)
-            };
+        // Reconstruct current text from the stored document, apply each incremental
+        // change in order, then re-parse. Avoids receiving the full document over IPC.
+        let doc = {
+            let mut ws = self.workspace.write().await;
 
-            let plugin_diags = match (plugin_data, &self.plugin_host) {
-                (Some((ctx, idx, snap)), Some(ph)) => ph.run(ctx, idx, snap).await,
-                _ => vec![],
-            };
-            let mut diags = schema_diags;
-            diags.extend(plugin_diags);
-            self.client.publish_diagnostics(uri, diags, None).await;
-        }
+            let existing_text = ws
+                .open_documents
+                .get(&uri)
+                .map(|d| reconstruct_text(d, delimiter))
+                .unwrap_or_default();
+
+            let mut lines: Vec<String> = existing_text.lines().map(str::to_owned).collect();
+            for change in &params.content_changes {
+                match change.range {
+                    Some(range) => apply_change(&mut lines, range, &change.text),
+                    None => lines = change.text.lines().map(str::to_owned).collect(),
+                }
+            }
+
+            let full_text = lines.join("\n");
+            let doc = Arc::new(DocumentData::parse(&full_text, delimiter));
+            let ref_targets = ws.ref_targets.clone();
+            ws.symbols.remove_file(&stem);
+            ws.symbols.index_document(&uri, &stem, &doc, &ref_targets);
+            let schema_diags = diagnostics::validate_document(
+                &stem, &doc, ws.schema.as_deref(), &ws.symbols,
+            );
+            ws.open_documents.insert(uri.clone(), Arc::clone(&doc));
+            let plugin_data = self.plugin_host.as_ref().map(|_| {
+                let ctx = plugin::build_context(&stem, &doc);
+                let idx = runtime::build_workspace_index(&ws.open_documents, &ws.file_cache);
+                let snap = plugin::build_workspace_snapshot(&ws.open_documents, &ws.file_cache);
+                (ctx, idx, snap)
+            });
+            (schema_diags, plugin_data, doc)
+        };
+
+        let (schema_diags, plugin_data, _doc) = doc;
+        let plugin_diags = match (plugin_data, &self.plugin_host) {
+            (Some((ctx, idx, snap)), Some(ph)) => ph.run(ctx, idx, snap).await,
+            _ => vec![],
+        };
+        let mut diags = schema_diags;
+        diags.extend(plugin_diags);
+        self.client.publish_diagnostics(uri, diags, None).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
